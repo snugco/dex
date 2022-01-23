@@ -7,12 +7,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/coreos/dex/api"
-	"github.com/coreos/dex/server/internal"
-	"github.com/coreos/dex/storage"
-	"github.com/coreos/dex/storage/memory"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+
+	"github.com/dexidp/dex/api/v2"
+	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/server/internal"
+	"github.com/dexidp/dex/storage"
+	"github.com/dexidp/dex/storage/memory"
 )
 
 // apiClient is a test gRPC client. When constructed, it runs a server in
@@ -21,25 +24,25 @@ import (
 type apiClient struct {
 	// Embedded gRPC client to talk to the server.
 	api.DexClient
-	// Close releases resources associated with this client, includuing shutting
+	// Close releases resources associated with this client, including shutting
 	// down the background server.
 	Close func()
 }
 
 // newAPI constructs a gRCP client connected to a backing server.
-func newAPI(s storage.Storage, logger logrus.FieldLogger, t *testing.T) *apiClient {
+func newAPI(s storage.Storage, logger log.Logger, t *testing.T) *apiClient {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	serv := grpc.NewServer()
-	api.RegisterDexServer(serv, NewAPI(s, logger))
+	api.RegisterDexServer(serv, NewAPI(s, logger, "test"))
 	go serv.Serve(l)
 
 	// Dial will retry automatically if the serv.Serve() goroutine
 	// hasn't started yet.
-	conn, err := grpc.Dial(l.Addr().String(), grpc.WithInsecure())
+	conn, err := grpc.Dial(l.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,8 +70,9 @@ func TestPassword(t *testing.T) {
 	defer client.Close()
 
 	ctx := context.Background()
+	email := "test@example.com"
 	p := api.Password{
-		Email: "test@example.com",
+		Email: email,
 		// bcrypt hash of the value "test1" with cost 10
 		Hash:     []byte("$2a$10$XVMN/Fid.Ks4CXgzo8fpR.iU1khOMsP5g9xQeXuBm1wXjRX8pjUtO"),
 		Username: "test",
@@ -91,8 +95,56 @@ func TestPassword(t *testing.T) {
 		t.Fatalf("Created password %s twice", createReq.Password.Email)
 	}
 
+	// Attempt to verify valid password and email
+	goodVerifyReq := &api.VerifyPasswordReq{
+		Email:    email,
+		Password: "test1",
+	}
+	goodVerifyResp, err := client.VerifyPassword(ctx, goodVerifyReq)
+	if err != nil {
+		t.Fatalf("Unable to run verify password we expected to be valid for correct email: %v", err)
+	}
+	if !goodVerifyResp.Verified {
+		t.Fatalf("verify password failed for password expected to be valid for correct email. expected %t, found %t", true, goodVerifyResp.Verified)
+	}
+	if goodVerifyResp.NotFound {
+		t.Fatalf("verify password failed to return not found response. expected %t, found %t", false, goodVerifyResp.NotFound)
+	}
+
+	// Check not found response for valid password with wrong email
+	badEmailVerifyReq := &api.VerifyPasswordReq{
+		Email:    "somewrongaddress@email.com",
+		Password: "test1",
+	}
+	badEmailVerifyResp, err := client.VerifyPassword(ctx, badEmailVerifyReq)
+	if err != nil {
+		t.Fatalf("Unable to run verify password for incorrect email: %v", err)
+	}
+	if badEmailVerifyResp.Verified {
+		t.Fatalf("verify password passed for password expected to be not found. expected %t, found %t", false, badEmailVerifyResp.Verified)
+	}
+	if !badEmailVerifyResp.NotFound {
+		t.Fatalf("expected not found response for verify password with bad email. expected %t, found %t", true, badEmailVerifyResp.NotFound)
+	}
+
+	// Check that wrong password fails
+	badPassVerifyReq := &api.VerifyPasswordReq{
+		Email:    email,
+		Password: "wrong_password",
+	}
+	badPassVerifyResp, err := client.VerifyPassword(ctx, badPassVerifyReq)
+	if err != nil {
+		t.Fatalf("Unable to run verify password for password we expected to be invalid: %v", err)
+	}
+	if badPassVerifyResp.Verified {
+		t.Fatalf("verify password passed for password we expected to fail. expected %t, found %t", false, badPassVerifyResp.Verified)
+	}
+	if badPassVerifyResp.NotFound {
+		t.Fatalf("did not expect expected not found response for verify password with bad email. expected %t, found %t", false, badPassVerifyResp.NotFound)
+	}
+
 	updateReq := api.UpdatePasswordReq{
-		Email:       "test@example.com",
+		Email:       email,
 		NewUsername: "test1",
 		NewEmail:    "test1@example.com",
 	}
@@ -121,7 +173,6 @@ func TestPassword(t *testing.T) {
 	if _, err := client.DeletePassword(ctx, &deleteReq); err != nil {
 		t.Fatalf("Unable to delete password: %v", err)
 	}
-
 }
 
 // Ensures checkCost returns expected values
@@ -181,7 +232,7 @@ func TestCheckCost(t *testing.T) {
 	}
 }
 
-// Attempts to list and revoke an exisiting refresh token.
+// Attempts to list and revoke an existing refresh token.
 func TestRefreshToken(t *testing.T) {
 	logger := &logrus.Logger{
 		Out:       os.Stderr,
@@ -246,7 +297,7 @@ func TestRefreshToken(t *testing.T) {
 		t.Errorf("failed to marshal offline session ID: %v", err)
 	}
 
-	//Testing the api.
+	// Testing the api.
 	listReq := api.ListRefreshReq{
 		UserId: subjectString,
 	}
@@ -281,7 +332,7 @@ func TestRefreshToken(t *testing.T) {
 
 	// Try to delete again.
 	//
-	// See https://github.com/coreos/dex/issues/1055
+	// See https://github.com/dexidp/dex/issues/1055
 	resp, err = client.RevokeRefresh(ctx, &revokeReq)
 	if err != nil {
 		t.Fatalf("Unable to revoke refresh tokens for user: %v", err)
@@ -293,4 +344,171 @@ func TestRefreshToken(t *testing.T) {
 	if resp, _ := client.ListRefresh(ctx, &listReq); len(resp.RefreshTokens) != 0 {
 		t.Fatalf("Refresh token returned inspite of revoking it.")
 	}
+}
+
+func TestUpdateClient(t *testing.T) {
+	logger := &logrus.Logger{
+		Out:       os.Stderr,
+		Formatter: &logrus.TextFormatter{DisableColors: true},
+		Level:     logrus.DebugLevel,
+	}
+
+	s := memory.New(logger)
+	client := newAPI(s, logger, t)
+	defer client.Close()
+	ctx := context.Background()
+
+	createClient := func(t *testing.T, clientId string) {
+		resp, err := client.CreateClient(ctx, &api.CreateClientReq{
+			Client: &api.Client{
+				Id:           clientId,
+				Secret:       "",
+				RedirectUris: []string{},
+				TrustedPeers: nil,
+				Public:       true,
+				Name:         "",
+				LogoUrl:      "",
+			},
+		})
+		if err != nil {
+			t.Fatalf("unable to create the client: %v", err)
+		}
+
+		if resp == nil {
+			t.Fatalf("create client returned no response")
+		}
+		if resp.AlreadyExists {
+			t.Error("existing client was found")
+		}
+
+		if resp.Client == nil {
+			t.Fatalf("no client created")
+		}
+	}
+
+	deleteClient := func(t *testing.T, clientId string) {
+		resp, err := client.DeleteClient(ctx, &api.DeleteClientReq{
+			Id: clientId,
+		})
+		if err != nil {
+			t.Fatalf("unable to delete the client: %v", err)
+		}
+		if resp == nil {
+			t.Fatalf("delete client delete client returned no response")
+		}
+	}
+
+	tests := map[string]struct {
+		setup   func(t *testing.T, clientId string)
+		cleanup func(t *testing.T, clientId string)
+		req     *api.UpdateClientReq
+		wantErr bool
+		want    *api.UpdateClientResp
+	}{
+		"update client": {
+			setup:   createClient,
+			cleanup: deleteClient,
+			req: &api.UpdateClientReq{
+				Id:           "test",
+				RedirectUris: []string{"https://redirect"},
+				TrustedPeers: []string{"test"},
+				Name:         "test",
+				LogoUrl:      "https://logout",
+			},
+			wantErr: false,
+			want: &api.UpdateClientResp{
+				NotFound: false,
+			},
+		},
+		"update client without ID": {
+			setup:   createClient,
+			cleanup: deleteClient,
+			req: &api.UpdateClientReq{
+				Id:           "",
+				RedirectUris: nil,
+				TrustedPeers: nil,
+				Name:         "test",
+				LogoUrl:      "test",
+			},
+			wantErr: true,
+			want: &api.UpdateClientResp{
+				NotFound: false,
+			},
+		},
+		"update client which not exists ": {
+			req: &api.UpdateClientReq{
+				Id:           "test",
+				RedirectUris: nil,
+				TrustedPeers: nil,
+				Name:         "test",
+				LogoUrl:      "test",
+			},
+			wantErr: true,
+			want: &api.UpdateClientResp{
+				NotFound: false,
+			},
+		},
+	}
+
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			if tc.setup != nil {
+				tc.setup(t, tc.req.Id)
+			}
+			resp, err := client.UpdateClient(ctx, tc.req)
+			if err != nil && !tc.wantErr {
+				t.Fatalf("failed to update the client: %v", err)
+			}
+
+			if !tc.wantErr {
+				if resp == nil {
+					t.Fatalf("update client response not found")
+				}
+
+				if tc.want.NotFound != resp.NotFound {
+					t.Errorf("expected in response NotFound: %t", tc.want.NotFound)
+				}
+
+				client, err := s.GetClient(tc.req.Id)
+				if err != nil {
+					t.Errorf("no client found in the storage: %v", err)
+				}
+
+				if tc.req.Id != client.ID {
+					t.Errorf("expected stored client with ID: %s, found %s", tc.req.Id, client.ID)
+				}
+				if tc.req.Name != client.Name {
+					t.Errorf("expected stored client with Name: %s, found %s", tc.req.Name, client.Name)
+				}
+				if tc.req.LogoUrl != client.LogoURL {
+					t.Errorf("expected stored client with LogoURL: %s, found %s", tc.req.LogoUrl, client.LogoURL)
+				}
+				for _, redirectURI := range tc.req.RedirectUris {
+					found := find(redirectURI, client.RedirectURIs)
+					if !found {
+						t.Errorf("expected redirect URI: %s", redirectURI)
+					}
+				}
+				for _, peer := range tc.req.TrustedPeers {
+					found := find(peer, client.TrustedPeers)
+					if !found {
+						t.Errorf("expected trusted peer: %s", peer)
+					}
+				}
+			}
+
+			if tc.cleanup != nil {
+				tc.cleanup(t, tc.req.Id)
+			}
+		})
+	}
+}
+
+func find(item string, items []string) bool {
+	for _, i := range items {
+		if item == i {
+			return true
+		}
+	}
+	return false
 }

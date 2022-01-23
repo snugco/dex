@@ -9,10 +9,11 @@ import (
 	"io/ioutil"
 	"net/http"
 
-	"github.com/coreos/dex/connector"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/oauth2"
 	fb "golang.org/x/oauth2/facebook"
+
+	"github.com/dexidp/dex/connector"
+	"github.com/dexidp/dex/pkg/log"
 )
 
 const (
@@ -32,7 +33,7 @@ type Config struct {
 }
 
 // Open returns a strategy for logging in through Facebook.
-func (c *Config) Open(id string, logger logrus.FieldLogger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
 	return &facebookConnector{
 		redirectURI:  c.RedirectURI,
 		org:          c.Org,
@@ -57,7 +58,7 @@ type facebookConnector struct {
 	org          string
 	clientID     string
 	clientSecret string
-	logger       logrus.FieldLogger
+	logger       log.Logger
 }
 
 func (c *facebookConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {

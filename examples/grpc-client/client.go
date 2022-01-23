@@ -6,17 +6,18 @@ import (
 	"crypto/x509"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
+	"os"
 
-	"github.com/coreos/dex/api"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+
+	"github.com/dexidp/dex/api/v2"
 )
 
 func newDexClient(hostAndPort, caPath, clientCrt, clientKey string) (api.DexClient, error) {
 	cPool := x509.NewCertPool()
-	caCert, err := ioutil.ReadFile(caPath)
+	caCert, err := os.ReadFile(caPath)
 	if err != nil {
 		return nil, fmt.Errorf("invalid CA crt file: %s", caPath)
 	}
@@ -37,7 +38,7 @@ func newDexClient(hostAndPort, caPath, clientCrt, clientKey string) (api.DexClie
 
 	conn, err := grpc.Dial(hostAndPort, grpc.WithTransportCredentials(creds))
 	if err != nil {
-		return nil, fmt.Errorf("dail: %v", err)
+		return nil, fmt.Errorf("dial: %v", err)
 	}
 	return api.NewDexClient(conn), nil
 }
@@ -69,6 +70,39 @@ func createPassword(cli api.DexClient) error {
 	if err != nil {
 		return fmt.Errorf("failed to list password: %v", err)
 	}
+
+	log.Print("Listing Passwords:\n")
+	for _, pass := range resp.Passwords {
+		log.Printf("%+v", pass)
+	}
+
+	// Verifying correct and incorrect passwords
+	log.Print("Verifying Password:\n")
+	verifyReq := &api.VerifyPasswordReq{
+		Email:    "test@example.com",
+		Password: "test1",
+	}
+	verifyResp, err := cli.VerifyPassword(context.TODO(), verifyReq)
+	if err != nil {
+		return fmt.Errorf("failed to run VerifyPassword for correct password: %v", err)
+	}
+	if !verifyResp.Verified {
+		return fmt.Errorf("failed to verify correct password: %v", verifyResp)
+	}
+	log.Printf("properly verified correct password: %t\n", verifyResp.Verified)
+
+	badVerifyReq := &api.VerifyPasswordReq{
+		Email:    "test@example.com",
+		Password: "wrong_password",
+	}
+	badVerifyResp, err := cli.VerifyPassword(context.TODO(), badVerifyReq)
+	if err != nil {
+		return fmt.Errorf("failed to run VerifyPassword for incorrect password: %v", err)
+	}
+	if badVerifyResp.Verified {
+		return fmt.Errorf("verify returned true for incorrect password: %v", badVerifyResp)
+	}
+	log.Printf("properly failed to verify incorrect password: %t\n", badVerifyResp.Verified)
 
 	log.Print("Listing Passwords:\n")
 	for _, pass := range resp.Passwords {

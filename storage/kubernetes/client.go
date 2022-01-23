@@ -13,7 +13,6 @@ import (
 	"hash"
 	"hash/fnv"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"os"
@@ -22,20 +21,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Masterminds/semver"
 	"github.com/ghodss/yaml"
-	"github.com/gtank/cryptopasta"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/net/http2"
 
-	"github.com/coreos/dex/storage"
-	"github.com/coreos/dex/storage/kubernetes/k8sapi"
+	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/storage"
+	"github.com/dexidp/dex/storage/kubernetes/k8sapi"
 )
 
 type client struct {
 	client    *http.Client
 	baseURL   string
 	namespace string
-	logger    logrus.FieldLogger
+	logger    log.Logger
 
 	// Hash function to map IDs (which could span a large range) to Kubernetes names.
 	// While this is not currently upgradable, it could be in the future.
@@ -48,6 +47,10 @@ type client struct {
 	// API version of the oidc resources. For example "oidc.coreos.com". This is
 	// currently not configurable, but could be in the future.
 	apiVersion string
+	// API version of the custom resource definitions.
+	// Different Kubernetes version requires to create CRD in certain API. It will be discovered automatically on
+	// storage opening.
+	crdAPIVersion string
 
 	// This is called once the client's Close method is called to signal goroutines,
 	// such as the one creating third party resources, to stop.
@@ -55,14 +58,14 @@ type client struct {
 }
 
 // idToName maps an arbitrary ID, such as an email or client ID to a Kubernetes object name.
-func (c *client) idToName(s string) string {
-	return idToName(s, c.hash)
+func (cli *client) idToName(s string) string {
+	return idToName(s, cli.hash)
 }
 
 // offlineTokenName maps two arbitrary IDs, to a single Kubernetes object name.
 // This is used when more than one field is used to uniquely identify the object.
-func (c *client) offlineTokenName(userID string, connID string) string {
-	return offlineTokenName(userID, connID, c.hash)
+func (cli *client) offlineTokenName(userID string, connID string) string {
+	return offlineTokenName(userID, connID, cli.hash)
 }
 
 // Kubernetes names must match the regexp '[a-z0-9]([-a-z0-9]*[a-z0-9])?'.
@@ -79,7 +82,7 @@ func offlineTokenName(userID string, connID string, h func() hash.Hash) string {
 	return strings.TrimRight(encoding.EncodeToString(hash.Sum(nil)), "=")
 }
 
-func (c *client) urlFor(apiVersion, namespace, resource, name string) string {
+func (cli *client) urlFor(apiVersion, namespace, resource, name string) string {
 	basePath := "apis/"
 	if apiVersion == "v1" {
 		basePath = "api/"
@@ -91,10 +94,10 @@ func (c *client) urlFor(apiVersion, namespace, resource, name string) string {
 	} else {
 		p = path.Join(basePath, apiVersion, resource, name)
 	}
-	if strings.HasSuffix(c.baseURL, "/") {
-		return c.baseURL + p
+	if strings.HasSuffix(cli.baseURL, "/") {
+		return cli.baseURL + p
 	}
-	return c.baseURL + "/" + p
+	return cli.baseURL + "/" + p
 }
 
 // Define an error interface so we can get at the underlying status code if it's
@@ -128,7 +131,7 @@ func checkHTTPErr(r *http.Response, validStatusCodes ...int) error {
 		}
 	}
 
-	body, err := ioutil.ReadAll(io.LimitReader(r.Body, 2<<15)) // 64 KiB
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2<<15)) // 64 KiB
 	if err != nil {
 		return fmt.Errorf("read response body: %v", err)
 	}
@@ -137,7 +140,7 @@ func checkHTTPErr(r *http.Response, validStatusCodes ...int) error {
 	if r.StatusCode == http.StatusNotFound {
 		return storage.ErrNotFound
 	}
-	if r.Request.Method == "POST" && r.StatusCode == http.StatusConflict {
+	if r.Request.Method == http.MethodPost && r.StatusCode == http.StatusConflict {
 		return storage.ErrAlreadyExists
 	}
 
@@ -152,13 +155,17 @@ func checkHTTPErr(r *http.Response, validStatusCodes ...int) error {
 // Close the response body. The initial request is drained so the connection can
 // be reused.
 func closeResp(r *http.Response) {
-	io.Copy(ioutil.Discard, r.Body)
+	io.Copy(io.Discard, r.Body)
 	r.Body.Close()
 }
 
-func (c *client) get(resource, name string, v interface{}) error {
-	url := c.urlFor(c.apiVersion, c.namespace, resource, name)
-	resp, err := c.client.Get(url)
+func (cli *client) get(resource, name string, v interface{}) error {
+	return cli.getResource(cli.apiVersion, cli.namespace, resource, name, v)
+}
+
+func (cli *client) getResource(apiVersion, namespace, resource, name string, v interface{}) error {
+	url := cli.urlFor(apiVersion, namespace, resource, name)
+	resp, err := cli.client.Get(url)
 	if err != nil {
 		return err
 	}
@@ -169,22 +176,22 @@ func (c *client) get(resource, name string, v interface{}) error {
 	return json.NewDecoder(resp.Body).Decode(v)
 }
 
-func (c *client) list(resource string, v interface{}) error {
-	return c.get(resource, "", v)
+func (cli *client) list(resource string, v interface{}) error {
+	return cli.get(resource, "", v)
 }
 
-func (c *client) post(resource string, v interface{}) error {
-	return c.postResource(c.apiVersion, c.namespace, resource, v)
+func (cli *client) post(resource string, v interface{}) error {
+	return cli.postResource(cli.apiVersion, cli.namespace, resource, v)
 }
 
-func (c *client) postResource(apiVersion, namespace, resource string, v interface{}) error {
+func (cli *client) postResource(apiVersion, namespace, resource string, v interface{}) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("marshal object: %v", err)
 	}
 
-	url := c.urlFor(apiVersion, namespace, resource, "")
-	resp, err := c.client.Post(url, "application/json", bytes.NewReader(body))
+	url := cli.urlFor(apiVersion, namespace, resource, "")
+	resp, err := cli.client.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -192,13 +199,44 @@ func (c *client) postResource(apiVersion, namespace, resource string, v interfac
 	return checkHTTPErr(resp, http.StatusCreated)
 }
 
-func (c *client) delete(resource, name string) error {
-	url := c.urlFor(c.apiVersion, c.namespace, resource, name)
+func (cli *client) detectKubernetesVersion() error {
+	var version struct{ GitVersion string }
+
+	url := cli.baseURL + "/version"
+	resp, err := cli.client.Get(url)
+	if err != nil {
+		return err
+	}
+
+	defer closeResp(resp)
+	if err := checkHTTPErr(resp, http.StatusOK); err != nil {
+		return err
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&version); err != nil {
+		return err
+	}
+
+	clusterVersion, err := semver.NewVersion(version.GitVersion)
+	if err != nil {
+		cli.logger.Warnf("cannot detect Kubernetes version (%s): %v", clusterVersion, err)
+		return nil
+	}
+
+	if clusterVersion.LessThan(semver.MustParse("v1.16.0")) {
+		cli.crdAPIVersion = legacyCRDAPIVersion
+	}
+
+	return nil
+}
+
+func (cli *client) delete(resource, name string) error {
+	url := cli.urlFor(cli.apiVersion, cli.namespace, resource, name)
 	req, err := http.NewRequest("DELETE", url, nil)
 	if err != nil {
 		return fmt.Errorf("create delete request: %v", err)
 	}
-	resp, err := c.client.Do(req)
+	resp, err := cli.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("delete request: %v", err)
 	}
@@ -206,7 +244,7 @@ func (c *client) delete(resource, name string) error {
 	return checkHTTPErr(resp, http.StatusOK)
 }
 
-func (c *client) deleteAll(resource string) error {
+func (cli *client) deleteAll(resource string) error {
 	var list struct {
 		k8sapi.TypeMeta `json:",inline"`
 		k8sapi.ListMeta `json:"metadata,omitempty"`
@@ -215,24 +253,24 @@ func (c *client) deleteAll(resource string) error {
 			k8sapi.ObjectMeta `json:"metadata,omitempty"`
 		} `json:"items"`
 	}
-	if err := c.list(resource, &list); err != nil {
+	if err := cli.list(resource, &list); err != nil {
 		return err
 	}
 	for _, item := range list.Items {
-		if err := c.delete(resource, item.Name); err != nil {
+		if err := cli.delete(resource, item.Name); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (c *client) put(resource, name string, v interface{}) error {
+func (cli *client) put(resource, name string, v interface{}) error {
 	body, err := json.Marshal(v)
 	if err != nil {
 		return fmt.Errorf("marshal object: %v", err)
 	}
 
-	url := c.urlFor(c.apiVersion, c.namespace, resource, name)
+	url := cli.urlFor(cli.apiVersion, cli.namespace, resource, name)
 	req, err := http.NewRequest("PUT", url, bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("create patch request: %v", err)
@@ -240,7 +278,7 @@ func (c *client) put(resource, name string, v interface{}) error {
 
 	req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 
-	resp, err := c.client.Do(req)
+	resp, err := cli.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("patch request: %v", err)
 	}
@@ -249,8 +287,23 @@ func (c *client) put(resource, name string, v interface{}) error {
 	return checkHTTPErr(resp, http.StatusOK)
 }
 
-func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, logger logrus.FieldLogger, useTPR bool) (*client, error) {
-	tlsConfig := cryptopasta.DefaultTLSConfig()
+// Copied from https://github.com/gtank/cryptopasta
+func defaultTLSConfig() *tls.Config {
+	return &tls.Config{
+		// Avoids most of the memorably-named TLS attacks
+		MinVersion: tls.VersionTLS12,
+		// Causes servers to use Go's default ciphersuite preferences,
+		// which are tuned to avoid attacks. Does nothing on clients.
+		PreferServerCipherSuites: true,
+		// Only use curves which have constant-time implementations
+		CurvePreferences: []tls.CurveID{
+			tls.CurveP256,
+		},
+	}
+}
+
+func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, logger log.Logger, inCluster bool) (*client, error) {
+	tlsConfig := defaultTLSConfig()
 	data := func(b string, file string) ([]byte, error) {
 		if b != "" {
 			return base64.StdEncoding.DecodeString(b)
@@ -258,7 +311,7 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 		if file == "" {
 			return nil, nil
 		}
-		return ioutil.ReadFile(file)
+		return os.ReadFile(file)
 	}
 
 	if caData, err := data(cluster.CertificateAuthorityData, cluster.CertificateAuthority); err != nil {
@@ -289,10 +342,10 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 	var t http.RoundTripper
 	httpTransport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
-		Dial: (&net.Dialer{
+		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
-		}).Dial,
+		}).DialContext,
 		TLSClientConfig:       tlsConfig,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -305,31 +358,9 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 	if err := http2.ConfigureTransport(httpTransport); err != nil {
 		return nil, err
 	}
-	t = httpTransport
+	t = wrapRoundTripper(httpTransport, user, inCluster)
 
-	if user.Token != "" {
-		t = transport{
-			updateReq: func(r *http.Request) {
-				r.Header.Set("Authorization", "Bearer "+user.Token)
-			},
-			base: t,
-		}
-	}
-
-	if user.Username != "" && user.Password != "" {
-		t = transport{
-			updateReq: func(r *http.Request) {
-				r.SetBasicAuth(user.Username, user.Password)
-			},
-			base: t,
-		}
-	}
-
-	// the API Group and version differ depending on if CRDs or TPRs are used.
 	apiVersion := "dex.coreos.com/v1"
-	if useTPR {
-		apiVersion = "oidc.coreos.com/v1"
-	}
 
 	logger.Infof("kubernetes client apiVersion = %s", apiVersion)
 	return &client{
@@ -337,34 +368,17 @@ func newClient(cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, l
 			Transport: t,
 			Timeout:   15 * time.Second,
 		},
-		baseURL:    cluster.Server,
-		hash:       func() hash.Hash { return fnv.New64() },
-		namespace:  namespace,
-		apiVersion: apiVersion,
-		logger:     logger,
+		baseURL:       cluster.Server,
+		hash:          func() hash.Hash { return fnv.New64() },
+		namespace:     namespace,
+		apiVersion:    apiVersion,
+		crdAPIVersion: crdAPIVersion,
+		logger:        logger,
 	}, nil
 }
 
-type transport struct {
-	updateReq func(r *http.Request)
-	base      http.RoundTripper
-}
-
-func (t transport) RoundTrip(r *http.Request) (*http.Response, error) {
-	// shallow copy of the struct
-	r2 := new(http.Request)
-	*r2 = *r
-	// deep copy of the Header
-	r2.Header = make(http.Header, len(r.Header))
-	for k, s := range r.Header {
-		r2.Header[k] = append([]string(nil), s...)
-	}
-	t.updateReq(r2)
-	return t.base.RoundTrip(r2)
-}
-
 func loadKubeConfig(kubeConfigPath string) (cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, err error) {
-	data, err := ioutil.ReadFile(kubeConfigPath)
+	data, err := os.ReadFile(kubeConfigPath)
 	if err != nil {
 		err = fmt.Errorf("read %s: %v", kubeConfigPath, err)
 		return
@@ -409,31 +423,76 @@ func namespaceFromServiceAccountJWT(s string) (string, error) {
 	return data.Namespace, nil
 }
 
-func inClusterConfig() (cluster k8sapi.Cluster, user k8sapi.AuthInfo, namespace string, err error) {
-	host, port := os.Getenv("KUBERNETES_SERVICE_HOST"), os.Getenv("KUBERNETES_SERVICE_PORT")
-	if len(host) == 0 || len(port) == 0 {
-		err = fmt.Errorf("unable to load in-cluster configuration, KUBERNETES_SERVICE_HOST and KUBERNETES_SERVICE_PORT must be defined")
-		return
-	}
-	cluster = k8sapi.Cluster{
-		Server:               "https://" + host + ":" + port,
-		CertificateAuthority: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt",
-	}
-	token, err := ioutil.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token")
+func namespaceFromFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return
-	}
-	user = k8sapi.AuthInfo{Token: string(token)}
-
-	if namespace = os.Getenv("KUBERNETES_POD_NAMESPACE"); namespace == "" {
-		namespace, err = namespaceFromServiceAccountJWT(user.Token)
-		if err != nil {
-			err = fmt.Errorf("failed to inspect service account token: %v", err)
-			return
-		}
+		return "", err
 	}
 
-	return
+	return string(data), nil
+}
+
+func getInClusterConfigNamespace(token, namespaceENV, namespacePath string) (string, error) {
+	namespace := os.Getenv(namespaceENV)
+	if namespace != "" {
+		return namespace, nil
+	}
+
+	namespace, err := namespaceFromServiceAccountJWT(token)
+	if err == nil {
+		return namespace, nil
+	}
+
+	err = fmt.Errorf("inspect service account token: %v", err)
+	namespace, fileErr := namespaceFromFile(namespacePath)
+	if fileErr == nil {
+		return namespace, nil
+	}
+
+	return "", fmt.Errorf("%v: trying to get namespace from file: %v", err, fileErr)
+}
+
+func inClusterConfig() (k8sapi.Cluster, k8sapi.AuthInfo, string, error) {
+	const (
+		serviceAccountPath          = "/var/run/secrets/kubernetes.io/serviceaccount/"
+		serviceAccountTokenPath     = serviceAccountPath + "token"
+		serviceAccountCAPath        = serviceAccountPath + "ca.crt"
+		serviceAccountNamespacePath = serviceAccountPath + "namespace"
+
+		kubernetesServiceHostENV  = "KUBERNETES_SERVICE_HOST"
+		kubernetesServicePortENV  = "KUBERNETES_SERVICE_PORT"
+		kubernetesPodNamespaceENV = "KUBERNETES_POD_NAMESPACE"
+	)
+
+	host, port := os.Getenv(kubernetesServiceHostENV), os.Getenv(kubernetesServicePortENV)
+	if len(host) == 0 || len(port) == 0 {
+		return k8sapi.Cluster{}, k8sapi.AuthInfo{}, "", fmt.Errorf(
+			"unable to load in-cluster configuration, %s and %s must be defined",
+			kubernetesServiceHostENV,
+			kubernetesServicePortENV,
+		)
+	}
+	// we need to wrap IPv6 addresses in square brackets
+	// IPv4 also works with square brackets
+	host = "[" + host + "]"
+	cluster := k8sapi.Cluster{
+		Server:               "https://" + host + ":" + port,
+		CertificateAuthority: serviceAccountCAPath,
+	}
+
+	token, err := os.ReadFile(serviceAccountTokenPath)
+	if err != nil {
+		return cluster, k8sapi.AuthInfo{}, "", err
+	}
+
+	user := k8sapi.AuthInfo{Token: string(token)}
+
+	namespace, err := getInClusterConfigNamespace(user.Token, kubernetesPodNamespaceENV, serviceAccountNamespacePath)
+	if err != nil {
+		return cluster, user, "", err
+	}
+
+	return cluster, user, namespace, nil
 }
 
 func currentContext(config *k8sapi.Config) (cluster k8sapi.Cluster, user k8sapi.AuthInfo, ns string, err error) {
@@ -444,7 +503,7 @@ func currentContext(config *k8sapi.Config) (cluster k8sapi.Cluster, user k8sapi.
 			return cluster, user, "", errors.New("kubeconfig has no current context")
 		}
 	}
-	context, ok := func() (k8sapi.Context, bool) {
+	k8sContext, ok := func() (k8sapi.Context, bool) {
 		for _, namedContext := range config.Contexts {
 			if namedContext.Name == config.CurrentContext {
 				return namedContext.Context, true
@@ -458,26 +517,26 @@ func currentContext(config *k8sapi.Config) (cluster k8sapi.Cluster, user k8sapi.
 
 	cluster, ok = func() (k8sapi.Cluster, bool) {
 		for _, namedCluster := range config.Clusters {
-			if namedCluster.Name == context.Cluster {
+			if namedCluster.Name == k8sContext.Cluster {
 				return namedCluster.Cluster, true
 			}
 		}
 		return k8sapi.Cluster{}, false
 	}()
 	if !ok {
-		return cluster, user, "", fmt.Errorf("no cluster named %q found", context.Cluster)
+		return cluster, user, "", fmt.Errorf("no cluster named %q found", k8sContext.Cluster)
 	}
 
 	user, ok = func() (k8sapi.AuthInfo, bool) {
 		for _, namedAuthInfo := range config.AuthInfos {
-			if namedAuthInfo.Name == context.AuthInfo {
+			if namedAuthInfo.Name == k8sContext.AuthInfo {
 				return namedAuthInfo.AuthInfo, true
 			}
 		}
 		return k8sapi.AuthInfo{}, false
 	}()
 	if !ok {
-		return cluster, user, "", fmt.Errorf("no user named %q found", context.AuthInfo)
+		return cluster, user, "", fmt.Errorf("no user named %q found", k8sContext.AuthInfo)
 	}
-	return cluster, user, context.Namespace, nil
+	return cluster, user, k8sContext.Namespace, nil
 }
