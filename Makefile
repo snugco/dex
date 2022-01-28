@@ -34,7 +34,7 @@ release-binary:
 
 .PHONY: release-binary-linux
 release-binary-linux:
-	CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o bin/dex -ldflags $(LD_FLAGS) $(REPO_PATH)/cmd/dex
+	CGO_ENABLED=1 GOOS=linux go build -a -installsuffix cgo -o bin/dex -ldflags $(LD_FLAGS) $(REPO_PATH)/cmd/dex
 
 .PHONY: revendor
 revendor:
