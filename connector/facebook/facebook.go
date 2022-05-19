@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 
 	"golang.org/x/oauth2"
@@ -61,8 +61,8 @@ type facebookConnector struct {
 	logger       log.Logger
 }
 
-func (c *facebookConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {
-	var facebookScopes []string = []string{scopeEmail, scopePublicProfile, scopeUserFriends}
+func (c *facebookConnector) oauth2Config() *oauth2.Config {
+	var facebookScopes = []string{scopeEmail, scopePublicProfile, scopeUserFriends}
 	return &oauth2.Config{
 		ClientID:     c.clientID,
 		ClientSecret: c.clientSecret,
@@ -76,7 +76,7 @@ func (c *facebookConnector) LoginURL(scopes connector.Scopes, callbackURL, state
 	if c.redirectURI != callbackURL {
 		return "", fmt.Errorf("expected callback URL did not match the URL in the config %s %s", c.redirectURI, callbackURL)
 	}
-	return c.oauth2Config(scopes).AuthCodeURL(state), nil
+	return c.oauth2Config().AuthCodeURL(state), nil
 }
 
 type oauth2Error struct {
@@ -98,7 +98,7 @@ func (c *facebookConnector) HandleCallback(s connector.Scopes, r *http.Request) 
 		return identity, &oauth2Error{errType, q.Get("error_description")}
 	}
 
-	oauth2Config := c.oauth2Config(s)
+	oauth2Config := c.oauth2Config()
 	ctx := r.Context()
 
 	token, err := oauth2Config.Exchange(ctx, code)
@@ -139,7 +139,7 @@ func (c *facebookConnector) Refresh(ctx context.Context, s connector.Scopes, ide
 		return ident, fmt.Errorf("facebook: unmarshal access token: %v", err)
 	}
 
-	client := c.oauth2Config(s).Client(ctx, &oauth2.Token{AccessToken: data.AccessToken})
+	client := c.oauth2Config().Client(ctx, &oauth2.Token{AccessToken: data.AccessToken})
 	user, err := c.user(ctx, client)
 	if err != nil {
 		return ident, fmt.Errorf("facebook: get user: %v", err)
@@ -168,7 +168,7 @@ func (c *facebookConnector) user(ctx context.Context, client *http.Client) (user
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return u, fmt.Errorf("facebook: read body: %v", err)
 		}
