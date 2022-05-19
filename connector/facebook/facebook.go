@@ -62,7 +62,7 @@ type facebookConnector struct {
 }
 
 func (c *facebookConnector) oauth2Config() *oauth2.Config {
-	var facebookScopes = []string{scopeEmail, scopePublicProfile, scopeUserFriends}
+	facebookScopes := []string{scopeEmail, scopePublicProfile, scopeUserFriends}
 	return &oauth2.Config{
 		ClientID:     c.clientID,
 		ClientSecret: c.clientSecret,
