@@ -165,7 +165,6 @@ func runServe(options serveOptions) error {
 				return errors.New("invalid config: failed to parse client CA")
 			}
 
-
 			tlsConfig.ClientAuth = tls.RequireAndVerifyClientCert
 			tlsConfig.ClientCAs = cPool
 
@@ -499,7 +498,6 @@ func (f *utcFormatter) Format(e *logrus.Entry) ([]byte, error) {
 	e.Time = e.Time.UTC()
 	return f.f.Format(e)
 }
-
 
 func newLogger(level string, format string) (log.Logger, error) {
 	var logLevel logrus.Level
