@@ -2,34 +2,50 @@ package server
 
 import (
 	"context"
+	"crypto/rsa"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
 	"net/url"
+	"os"
 	"path"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/bcrypt"
-
+	gosundheit "github.com/AppsFlyer/go-sundheit"
+	"github.com/felixge/httpsnoop"
 	"github.com/gorilla/handlers"
 	"github.com/gorilla/mux"
-	"github.com/sirupsen/logrus"
+	"github.com/prometheus/client_golang/prometheus"
+	"golang.org/x/crypto/bcrypt"
 
-	"github.com/coreos/dex/connector"
-	"github.com/coreos/dex/connector/authproxy"
-	"github.com/coreos/dex/connector/facebook"
-	"github.com/coreos/dex/connector/github"
-	"github.com/coreos/dex/connector/gitlab"
-	"github.com/coreos/dex/connector/ldap"
-	"github.com/coreos/dex/connector/linkedin"
-	"github.com/coreos/dex/connector/mock"
-	"github.com/coreos/dex/connector/oidc"
-	"github.com/coreos/dex/connector/saml"
-	"github.com/coreos/dex/storage"
+	"github.com/dexidp/dex/connector"
+	"github.com/dexidp/dex/connector/atlassiancrowd"
+	"github.com/dexidp/dex/connector/authproxy"
+	"github.com/dexidp/dex/connector/bitbucketcloud"
+	"github.com/dexidp/dex/connector/facebook"
+	"github.com/dexidp/dex/connector/gitea"
+	"github.com/dexidp/dex/connector/github"
+	"github.com/dexidp/dex/connector/gitlab"
+	"github.com/dexidp/dex/connector/google"
+	"github.com/dexidp/dex/connector/keystone"
+	"github.com/dexidp/dex/connector/ldap"
+	"github.com/dexidp/dex/connector/linkedin"
+	"github.com/dexidp/dex/connector/microsoft"
+	"github.com/dexidp/dex/connector/mock"
+	"github.com/dexidp/dex/connector/oauth"
+	"github.com/dexidp/dex/connector/oidc"
+	"github.com/dexidp/dex/connector/openshift"
+	"github.com/dexidp/dex/connector/saml"
+	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/storage"
+	"github.com/dexidp/dex/web"
 )
 
 // LocalConnector is the local passwordDB connector which is an internal
@@ -64,8 +80,19 @@ type Config struct {
 	// Logging in implies approval.
 	SkipApprovalScreen bool
 
-	RotateKeysAfter  time.Duration // Defaults to 6 hours.
-	IDTokensValidFor time.Duration // Defaults to 24 hours
+	// If enabled, the connectors selection page will always be shown even if there's only one
+	AlwaysShowLoginScreen bool
+
+	RotateKeysAfter        time.Duration // Defaults to 6 hours.
+	IDTokensValidFor       time.Duration // Defaults to 24 hours
+	AuthRequestsValidFor   time.Duration // Defaults to 24 hours
+	DeviceRequestsValidFor time.Duration // Defaults to 5 minutes
+
+	// Refresh token expiration settings
+	RefreshTokenPolicy *RefreshTokenPolicy
+
+	// If set, the server will use this connector to handle password grants
+	PasswordConnector string
 
 	GCFrequency time.Duration // Defaults to 5 minutes
 
@@ -74,23 +101,30 @@ type Config struct {
 
 	Web WebConfig
 
-	Logger logrus.FieldLogger
+	Logger log.Logger
+
+	PrometheusRegistry *prometheus.Registry
+
+	HealthChecker gosundheit.Health
 }
 
 // WebConfig holds the server's frontend templates and asset configuration.
-//
-// These are currently very custom to CoreOS and it's not recommended that
-// outside users attempt to customize these.
 type WebConfig struct {
-	// A filepath to web static.
+	// A file path to static web assets.
 	//
 	// It is expected to contain the following directories:
 	//
 	//   * static - Static static served at "( issuer URL )/static".
 	//   * templates - HTML templates controlled by dex.
 	//   * themes/(theme) - Static static served at "( issuer URL )/theme".
-	//
 	Dir string
+
+	// Alternative way to programatically configure static web assets.
+	// If Dir is specified, WebFS is ignored.
+	// It's expected to contain the same files and directories as mentioned above.
+	//
+	// Note: this is experimental. Might get removed without notice!
+	WebFS fs.FS
 
 	// Defaults to "( issuer URL )/theme/logo.png"
 	LogoURL string
@@ -98,8 +132,11 @@ type WebConfig struct {
 	// Defaults to "dex"
 	Issuer string
 
-	// Defaults to "coreos"
+	// Defaults to "light"
 	Theme string
+
+	// Map of extra values passed into the templates
+	Extra map[string]string
 }
 
 func value(val, defaultValue time.Duration) time.Duration {
@@ -127,13 +164,25 @@ type Server struct {
 	// If enabled, don't prompt user for approval after logging in through connector.
 	skipApproval bool
 
+	// If enabled, show the connector selection screen even if there's only one
+	alwaysShowLogin bool
+
+	// Used for password grant
+	passwordConnector string
+
 	supportedResponseTypes map[string]bool
+
+	supportedGrantTypes []string
 
 	now func() time.Time
 
-	idTokensValidFor time.Duration
+	idTokensValidFor       time.Duration
+	authRequestsValidFor   time.Duration
+	deviceRequestsValidFor time.Duration
 
-	logger logrus.FieldLogger
+	refreshTokenPolicy *RefreshTokenPolicy
+
+	logger log.Logger
 }
 
 // NewServer constructs a server from the provided config.
@@ -141,6 +190,13 @@ func NewServer(ctx context.Context, c Config) (*Server, error) {
 	return newServer(ctx, c, defaultRotationStrategy(
 		value(c.RotateKeysAfter, 6*time.Hour),
 		value(c.IDTokensValidFor, 24*time.Hour),
+	))
+}
+
+// NewServerWithKey constructs a server from the provided config and a static signing key.
+func NewServerWithKey(ctx context.Context, c Config, privateKey *rsa.PrivateKey) (*Server, error) {
+	return newServer(ctx, c, staticRotationStrategy(
+		privateKey,
 	))
 }
 
@@ -153,26 +209,48 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	if c.Storage == nil {
 		return nil, errors.New("server: storage cannot be nil")
 	}
+
 	if len(c.SupportedResponseTypes) == 0 {
 		c.SupportedResponseTypes = []string{responseTypeCode}
 	}
 
-	supported := make(map[string]bool)
+	supportedGrant := []string{grantTypeAuthorizationCode, grantTypeRefreshToken, grantTypeDeviceCode} // default
+	supportedRes := make(map[string]bool)
+
 	for _, respType := range c.SupportedResponseTypes {
 		switch respType {
-		case responseTypeCode, responseTypeIDToken, responseTypeToken:
+		case responseTypeCode, responseTypeIDToken:
+			// continue
+		case responseTypeToken:
+			// response_type=token is an implicit flow, let's add it to the discovery info
+			// https://datatracker.ietf.org/doc/html/rfc6749#section-4.2.1
+			supportedGrant = append(supportedGrant, grantTypeImplicit)
 		default:
 			return nil, fmt.Errorf("unsupported response_type %q", respType)
 		}
-		supported[respType] = true
+		supportedRes[respType] = true
+	}
+
+	if c.PasswordConnector != "" {
+		supportedGrant = append(supportedGrant, grantTypePassword)
+	}
+
+	sort.Strings(supportedGrant)
+
+	webFS := web.FS()
+	if c.Web.Dir != "" {
+		webFS = os.DirFS(c.Web.Dir)
+	} else if c.Web.WebFS != nil {
+		webFS = c.Web.WebFS
 	}
 
 	web := webConfig{
-		dir:       c.Web.Dir,
+		webFS:     webFS,
 		logoURL:   c.Web.LogoURL,
 		issuerURL: c.Issuer,
 		issuer:    c.Web.Issuer,
 		theme:     c.Web.Theme,
+		extra:     c.Web.Extra,
 	}
 
 	static, theme, tmpls, err := loadWebConfig(web)
@@ -189,11 +267,17 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		issuerURL:              *issuerURL,
 		connectors:             make(map[string]Connector),
 		storage:                newKeyCacher(c.Storage, now),
-		supportedResponseTypes: supported,
+		supportedResponseTypes: supportedRes,
+		supportedGrantTypes:    supportedGrant,
 		idTokensValidFor:       value(c.IDTokensValidFor, 24*time.Hour),
+		authRequestsValidFor:   value(c.AuthRequestsValidFor, 24*time.Hour),
+		deviceRequestsValidFor: value(c.DeviceRequestsValidFor, 5*time.Minute),
+		refreshTokenPolicy:     c.RefreshTokenPolicy,
 		skipApproval:           c.SkipApprovalScreen,
+		alwaysShowLogin:        c.AlwaysShowLoginScreen,
 		now:                    now,
 		templates:              tmpls,
+		passwordConnector:      c.PasswordConnector,
 		logger:                 c.Logger,
 	}
 
@@ -214,9 +298,35 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 		}
 	}
 
-	r := mux.NewRouter()
+	instrumentHandlerCounter := func(_ string, handler http.Handler) http.HandlerFunc {
+		return handler.ServeHTTP
+	}
+
+	if c.PrometheusRegistry != nil {
+		requestCounter := prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "http_requests_total",
+			Help: "Count of all HTTP requests.",
+		}, []string{"handler", "code", "method"})
+
+		err = c.PrometheusRegistry.Register(requestCounter)
+		if err != nil {
+			return nil, fmt.Errorf("server: Failed to register Prometheus HTTP metrics: %v", err)
+		}
+
+		instrumentHandlerCounter = func(handlerName string, handler http.Handler) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				m := httpsnoop.CaptureMetrics(handler, w, r)
+				requestCounter.With(prometheus.Labels{"handler": handlerName, "code": strconv.Itoa(m.Code), "method": r.Method}).Inc()
+			}
+		}
+	}
+
+	r := mux.NewRouter().SkipClean(true).UseEncodedPath()
+	handle := func(p string, h http.Handler) {
+		r.Handle(path.Join(issuerURL.Path, p), instrumentHandlerCounter(p, h))
+	}
 	handleFunc := func(p string, h http.HandlerFunc) {
-		r.HandleFunc(path.Join(issuerURL.Path, p), h)
+		handle(p, h)
 	}
 	handlePrefix := func(p string, h http.Handler) {
 		prefix := path.Join(issuerURL.Path, p)
@@ -225,12 +335,18 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	handleWithCORS := func(p string, h http.HandlerFunc) {
 		var handler http.Handler = h
 		if len(c.AllowedOrigins) > 0 {
-			corsOption := handlers.AllowedOrigins(c.AllowedOrigins)
-			handler = handlers.CORS(corsOption)(handler)
+			allowedHeaders := []string{
+				"Authorization",
+			}
+			cors := handlers.CORS(
+				handlers.AllowedOrigins(c.AllowedOrigins),
+				handlers.AllowedHeaders(allowedHeaders),
+			)
+			handler = cors(handler)
 		}
-		r.Handle(path.Join(issuerURL.Path, p), handler)
+		r.Handle(path.Join(issuerURL.Path, p), instrumentHandlerCounter(p, handler))
 	}
-	r.NotFoundHandler = http.HandlerFunc(http.NotFound)
+	r.NotFoundHandler = http.NotFoundHandler()
 
 	discoveryHandler, err := s.discoveryHandler()
 	if err != nil {
@@ -241,8 +357,16 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	// TODO(ericchiang): rate limit certain paths based on IP.
 	handleWithCORS("/token", s.handleToken)
 	handleWithCORS("/keys", s.handlePublicKeys)
+	handleWithCORS("/userinfo", s.handleUserInfo)
 	handleFunc("/auth", s.handleAuthorization)
 	handleFunc("/auth/{connector}", s.handleConnectorLogin)
+	handleFunc("/auth/{connector}/login", s.handlePasswordLogin)
+	handleFunc("/device", s.handleDeviceExchange)
+	handleFunc("/device/auth/verify_code", s.verifyUserCode)
+	handleFunc("/device/code", s.handleDeviceCode)
+	// TODO(nabokihms): "/device/token" endpoint is deprecated, consider using /token endpoint instead
+	handleFunc("/device/token", s.handleDeviceTokenDeprecated)
+	handleFunc(deviceCallbackURI, s.handleDeviceCallback)
 	r.HandleFunc(path.Join(issuerURL.Path, "/callback"), func(w http.ResponseWriter, r *http.Request) {
 		// Strip the X-Remote-* headers to prevent security issues on
 		// misconfigured authproxy connector setups.
@@ -257,7 +381,14 @@ func newServer(ctx context.Context, c Config, rotationStrategy rotationStrategy)
 	// "authproxy" connector.
 	handleFunc("/callback/{connector}", s.handleConnectorCallback)
 	handleFunc("/approval", s.handleApproval)
-	handleFunc("/healthz", s.handleHealth)
+	handle("/healthz", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !c.HealthChecker.IsHealthy() {
+			s.renderError(r, w, http.StatusInternalServerError, "Health check failed.")
+			return
+		}
+		fmt.Fprintf(w, "Health check passed")
+	}))
+
 	handlePrefix("/static", static)
 	handlePrefix("/theme", theme)
 	s.mux = r
@@ -345,6 +476,10 @@ func (db passwordDB) Refresh(ctx context.Context, s connector.Scopes, identity c
 	return identity, nil
 }
 
+func (db passwordDB) Prompt() string {
+	return "Email Address"
+}
+
 // newKeyCacher returns a storage which caches keys so long as the next
 func newKeyCacher(s storage.Storage, now func() time.Time) storage.Storage {
 	if now == nil {
@@ -386,39 +521,47 @@ func (s *Server) startGarbageCollection(ctx context.Context, frequency time.Dura
 			case <-time.After(frequency):
 				if r, err := s.storage.GarbageCollect(now()); err != nil {
 					s.logger.Errorf("garbage collection failed: %v", err)
-				} else if r.AuthRequests > 0 || r.AuthCodes > 0 {
-					s.logger.Infof("garbage collection run, delete auth requests=%d, auth codes=%d", r.AuthRequests, r.AuthCodes)
+				} else if !r.IsEmpty() {
+					s.logger.Infof("garbage collection run, delete auth requests=%d, auth codes=%d, device requests=%d, device tokens=%d",
+						r.AuthRequests, r.AuthCodes, r.DeviceRequests, r.DeviceTokens)
 				}
 			}
 		}
 	}()
-	return
 }
 
 // ConnectorConfig is a configuration that can open a connector.
 type ConnectorConfig interface {
-	Open(id string, logger logrus.FieldLogger) (connector.Connector, error)
+	Open(id string, logger log.Logger) (connector.Connector, error)
 }
 
 // ConnectorsConfig variable provides an easy way to return a config struct
 // depending on the connector type.
 var ConnectorsConfig = map[string]func() ConnectorConfig{
-	"mockCallback": func() ConnectorConfig { return new(mock.CallbackConfig) },
-	"mockPassword": func() ConnectorConfig { return new(mock.PasswordConfig) },
-	"ldap":         func() ConnectorConfig { return new(ldap.Config) },
-	"github":       func() ConnectorConfig { return new(github.Config) },
-	"gitlab":       func() ConnectorConfig { return new(gitlab.Config) },
-	"oidc":         func() ConnectorConfig { return new(oidc.Config) },
-	"saml":         func() ConnectorConfig { return new(saml.Config) },
-	"authproxy":    func() ConnectorConfig { return new(authproxy.Config) },
-	"linkedin":     func() ConnectorConfig { return new(linkedin.Config) },
-	"facebook":     func() ConnectorConfig { return new(facebook.Config) },
+	"keystone":        func() ConnectorConfig { return new(keystone.Config) },
+	"mockCallback":    func() ConnectorConfig { return new(mock.CallbackConfig) },
+	"mockPassword":    func() ConnectorConfig { return new(mock.PasswordConfig) },
+	"ldap":            func() ConnectorConfig { return new(ldap.Config) },
+	"gitea":           func() ConnectorConfig { return new(gitea.Config) },
+	"github":          func() ConnectorConfig { return new(github.Config) },
+	"gitlab":          func() ConnectorConfig { return new(gitlab.Config) },
+	"google":          func() ConnectorConfig { return new(google.Config) },
+	"oidc":            func() ConnectorConfig { return new(oidc.Config) },
+	"oauth":           func() ConnectorConfig { return new(oauth.Config) },
+	"saml":            func() ConnectorConfig { return new(saml.Config) },
+	"authproxy":       func() ConnectorConfig { return new(authproxy.Config) },
+	"linkedin":        func() ConnectorConfig { return new(linkedin.Config) },
+	"microsoft":       func() ConnectorConfig { return new(microsoft.Config) },
+	"bitbucket-cloud": func() ConnectorConfig { return new(bitbucketcloud.Config) },
+	"openshift":       func() ConnectorConfig { return new(openshift.Config) },
+	"atlassian-crowd": func() ConnectorConfig { return new(atlassiancrowd.Config) },
+	"facebook":        func() ConnectorConfig { return new(facebook.Config) },
 	// Keep around for backwards compatibility.
 	"samlExperimental": func() ConnectorConfig { return new(saml.Config) },
 }
 
 // openConnector will parse the connector config and open the connector.
-func openConnector(logger logrus.FieldLogger, conn storage.Connector) (connector.Connector, error) {
+func openConnector(logger log.Logger, conn storage.Connector) (connector.Connector, error) {
 	var c connector.Connector
 
 	f, ok := ConnectorsConfig[conn.Type]
@@ -450,7 +593,7 @@ func (s *Server) OpenConnector(conn storage.Connector) (Connector, error) {
 		c = newPasswordDB(s.storage)
 	} else {
 		var err error
-		c, err = openConnector(s.logger.WithField("connector", conn.Name), conn)
+		c, err = openConnector(s.logger, conn)
 		if err != nil {
 			return Connector{}, fmt.Errorf("failed to open connector: %v", err)
 		}

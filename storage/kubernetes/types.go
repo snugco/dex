@@ -6,217 +6,227 @@ import (
 
 	jose "gopkg.in/square/go-jose.v2"
 
-	"github.com/coreos/dex/storage"
-	"github.com/coreos/dex/storage/kubernetes/k8sapi"
+	"github.com/dexidp/dex/storage"
+	"github.com/dexidp/dex/storage/kubernetes/k8sapi"
 )
 
-var tprMeta = k8sapi.TypeMeta{
-	APIVersion: "extensions/v1beta1",
-	Kind:       "ThirdPartyResource",
-}
+const (
+	apiGroup = "dex.coreos.com"
 
-// The set of third party resources required by the storage. These are managed by
-// the storage so it can migrate itself by creating new resources.
-var thirdPartyResources = []k8sapi.ThirdPartyResource{
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "auth-code.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "A code which can be claimed for an access token.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "auth-request.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "A request for an end user to authorize a client.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "o-auth2-client.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "An OpenID Connect client.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "signing-key.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "Keys used to sign and verify OpenID Connect tokens.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "refresh-token.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "Refresh tokens for clients to continuously act on behalf of an end user.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "password.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "Passwords managed by the OIDC server.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "offline-sessions.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "User sessions with an active refresh token.",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "connector.oidc.coreos.com",
-		},
-		TypeMeta:    tprMeta,
-		Description: "Connectors available for login",
-		Versions:    []k8sapi.APIVersion{{Name: "v1"}},
-	},
-}
-
-var crdMeta = k8sapi.TypeMeta{
-	APIVersion: "apiextensions.k8s.io/v1beta1",
-	Kind:       "CustomResourceDefinition",
-}
-
-const apiGroup = "dex.coreos.com"
+	legacyCRDAPIVersion = "apiextensions.k8s.io/v1beta1"
+	crdAPIVersion       = "apiextensions.k8s.io/v1"
+)
 
 // The set of custom resource definitions required by the storage. These are managed by
 // the storage so it can migrate itself by creating new resources.
-var customResourceDefinitions = []k8sapi.CustomResourceDefinition{
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "authcodes.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "authcodes",
-				Singular: "authcode",
-				Kind:     "AuthCode",
+func customResourceDefinitions(apiVersion string) []k8sapi.CustomResourceDefinition {
+	crdMeta := k8sapi.TypeMeta{
+		APIVersion: apiVersion,
+		Kind:       "CustomResourceDefinition",
+	}
+
+	var version string
+	var scope k8sapi.ResourceScope
+	var versions []k8sapi.CustomResourceDefinitionVersion
+
+	switch apiVersion {
+	case crdAPIVersion:
+		preserveUnknownFields := true
+		versions = []k8sapi.CustomResourceDefinitionVersion{
+			{
+				Name:    "v1",
+				Served:  true,
+				Storage: true,
+				Schema: &k8sapi.CustomResourceValidation{
+					OpenAPIV3Schema: &k8sapi.JSONSchemaProps{
+						Type:                   "object",
+						XPreserveUnknownFields: &preserveUnknownFields,
+					},
+				},
+			},
+		}
+		scope = k8sapi.NamespaceScoped
+	case legacyCRDAPIVersion:
+		version = "v1"
+	default:
+		panic("unknown apiVersion " + apiVersion)
+	}
+
+	return []k8sapi.CustomResourceDefinition{
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "authcodes.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "authcodes",
+					Singular: "authcode",
+					Kind:     "AuthCode",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "authrequests.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "authrequests",
-				Singular: "authrequest",
-				Kind:     "AuthRequest",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "authrequests.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "authrequests",
+					Singular: "authrequest",
+					Kind:     "AuthRequest",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "oauth2clients.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "oauth2clients",
-				Singular: "oauth2client",
-				Kind:     "OAuth2Client",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "oauth2clients.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "oauth2clients",
+					Singular: "oauth2client",
+					Kind:     "OAuth2Client",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "signingkeies.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				// `signingkeies` is an artifact from the old TPR pluralization.
-				// Users don't directly interact with this value, hence leaving it
-				// as is.
-				Plural:   "signingkeies",
-				Singular: "signingkey",
-				Kind:     "SigningKey",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "signingkeies.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					// `signingkeies` is an artifact from the old TPR pluralization.
+					// Users don't directly interact with this value, hence leaving it
+					// as is.
+					Plural:   "signingkeies",
+					Singular: "signingkey",
+					Kind:     "SigningKey",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "refreshtokens.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "refreshtokens",
-				Singular: "refreshtoken",
-				Kind:     "RefreshToken",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "refreshtokens.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "refreshtokens",
+					Singular: "refreshtoken",
+					Kind:     "RefreshToken",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "passwords.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "passwords",
-				Singular: "password",
-				Kind:     "Password",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "passwords.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "passwords",
+					Singular: "password",
+					Kind:     "Password",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "offlinesessionses.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "offlinesessionses",
-				Singular: "offlinesessions",
-				Kind:     "OfflineSessions",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "offlinesessionses.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "offlinesessionses",
+					Singular: "offlinesessions",
+					Kind:     "OfflineSessions",
+				},
 			},
 		},
-	},
-	{
-		ObjectMeta: k8sapi.ObjectMeta{
-			Name: "connectors.dex.coreos.com",
-		},
-		TypeMeta: crdMeta,
-		Spec: k8sapi.CustomResourceDefinitionSpec{
-			Group:   apiGroup,
-			Version: "v1",
-			Names: k8sapi.CustomResourceDefinitionNames{
-				Plural:   "connectors",
-				Singular: "connector",
-				Kind:     "Connector",
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "connectors.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "connectors",
+					Singular: "connector",
+					Kind:     "Connector",
+				},
 			},
 		},
-	},
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "devicerequests.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "devicerequests",
+					Singular: "devicerequest",
+					Kind:     "DeviceRequest",
+				},
+			},
+		},
+		{
+			ObjectMeta: k8sapi.ObjectMeta{
+				Name: "devicetokens.dex.coreos.com",
+			},
+			TypeMeta: crdMeta,
+			Spec: k8sapi.CustomResourceDefinitionSpec{
+				Group:    apiGroup,
+				Version:  version,
+				Versions: versions,
+				Scope:    scope,
+				Names: k8sapi.CustomResourceDefinitionNames{
+					Plural:   "devicetokens",
+					Singular: "devicetoken",
+					Kind:     "DeviceToken",
+				},
+			},
+		},
+	}
 }
 
 // There will only ever be a single keys resource. Maintain this by setting a
@@ -284,30 +294,33 @@ func toStorageClient(c Client) storage.Client {
 
 // Claims is a mirrored struct from storage with JSON struct tags.
 type Claims struct {
-	UserID        string   `json:"userID"`
-	Username      string   `json:"username"`
-	Email         string   `json:"email"`
-	EmailVerified bool     `json:"emailVerified"`
-	Groups        []string `json:"groups,omitempty"`
+	UserID            string   `json:"userID"`
+	Username          string   `json:"username"`
+	PreferredUsername string   `json:"preferredUsername"`
+	Email             string   `json:"email"`
+	EmailVerified     bool     `json:"emailVerified"`
+	Groups            []string `json:"groups,omitempty"`
 }
 
 func fromStorageClaims(i storage.Claims) Claims {
 	return Claims{
-		UserID:        i.UserID,
-		Username:      i.Username,
-		Email:         i.Email,
-		EmailVerified: i.EmailVerified,
-		Groups:        i.Groups,
+		UserID:            i.UserID,
+		Username:          i.Username,
+		PreferredUsername: i.PreferredUsername,
+		Email:             i.Email,
+		EmailVerified:     i.EmailVerified,
+		Groups:            i.Groups,
 	}
 }
 
 func toStorageClaims(i Claims) storage.Claims {
 	return storage.Claims{
-		UserID:        i.UserID,
-		Username:      i.Username,
-		Email:         i.Email,
-		EmailVerified: i.EmailVerified,
-		Groups:        i.Groups,
+		UserID:            i.UserID,
+		Username:          i.Username,
+		PreferredUsername: i.PreferredUsername,
+		Email:             i.Email,
+		EmailVerified:     i.EmailVerified,
+		Groups:            i.Groups,
 	}
 }
 
@@ -340,6 +353,9 @@ type AuthRequest struct {
 	ConnectorData []byte `json:"connectorData,omitempty"`
 
 	Expiry time.Time `json:"expiry"`
+
+	CodeChallenge       string `json:"code_challenge,omitempty"`
+	CodeChallengeMethod string `json:"code_challenge_method,omitempty"`
 }
 
 // AuthRequestList is a list of AuthRequests.
@@ -364,6 +380,10 @@ func toStorageAuthRequest(req AuthRequest) storage.AuthRequest {
 		ConnectorData:       req.ConnectorData,
 		Expiry:              req.Expiry,
 		Claims:              toStorageClaims(req.Claims),
+		PKCE: storage.PKCE{
+			CodeChallenge:       req.CodeChallenge,
+			CodeChallengeMethod: req.CodeChallengeMethod,
+		},
 	}
 	return a
 }
@@ -390,11 +410,13 @@ func (cli *client) fromStorageAuthRequest(a storage.AuthRequest) AuthRequest {
 		ConnectorData:       a.ConnectorData,
 		Expiry:              a.Expiry,
 		Claims:              fromStorageClaims(a.Claims),
+		CodeChallenge:       a.PKCE.CodeChallenge,
+		CodeChallengeMethod: a.PKCE.CodeChallengeMethod,
 	}
 	return req
 }
 
-// Password is a mirrored struct from the stroage with JSON struct tags and
+// Password is a mirrored struct from the storage with JSON struct tags and
 // Kubernetes type metadata.
 type Password struct {
 	k8sapi.TypeMeta   `json:",inline"`
@@ -463,6 +485,9 @@ type AuthCode struct {
 	ConnectorData []byte `json:"connectorData,omitempty"`
 
 	Expiry time.Time `json:"expiry"`
+
+	CodeChallenge       string `json:"code_challenge,omitempty"`
+	CodeChallengeMethod string `json:"code_challenge_method,omitempty"`
 }
 
 // AuthCodeList is a list of AuthCodes.
@@ -482,14 +507,16 @@ func (cli *client) fromStorageAuthCode(a storage.AuthCode) AuthCode {
 			Name:      a.ID,
 			Namespace: cli.namespace,
 		},
-		ClientID:      a.ClientID,
-		RedirectURI:   a.RedirectURI,
-		ConnectorID:   a.ConnectorID,
-		ConnectorData: a.ConnectorData,
-		Nonce:         a.Nonce,
-		Scopes:        a.Scopes,
-		Claims:        fromStorageClaims(a.Claims),
-		Expiry:        a.Expiry,
+		ClientID:            a.ClientID,
+		RedirectURI:         a.RedirectURI,
+		ConnectorID:         a.ConnectorID,
+		ConnectorData:       a.ConnectorData,
+		Nonce:               a.Nonce,
+		Scopes:              a.Scopes,
+		Claims:              fromStorageClaims(a.Claims),
+		Expiry:              a.Expiry,
+		CodeChallenge:       a.PKCE.CodeChallenge,
+		CodeChallengeMethod: a.PKCE.CodeChallengeMethod,
 	}
 }
 
@@ -504,6 +531,10 @@ func toStorageAuthCode(a AuthCode) storage.AuthCode {
 		Scopes:        a.Scopes,
 		Claims:        toStorageClaims(a.Claims),
 		Expiry:        a.Expiry,
+		PKCE: storage.PKCE{
+			CodeChallenge:       a.CodeChallenge,
+			CodeChallengeMethod: a.CodeChallengeMethod,
+		},
 	}
 }
 
@@ -519,7 +550,8 @@ type RefreshToken struct {
 	ClientID string   `json:"clientID"`
 	Scopes   []string `json:"scopes,omitempty"`
 
-	Token string `json:"token,omitempty"`
+	Token         string `json:"token,omitempty"`
+	ObsoleteToken string `json:"obsoleteToken,omitempty"`
 
 	Nonce string `json:"nonce,omitempty"`
 
@@ -539,6 +571,7 @@ func toStorageRefreshToken(r RefreshToken) storage.RefreshToken {
 	return storage.RefreshToken{
 		ID:            r.ObjectMeta.Name,
 		Token:         r.Token,
+		ObsoleteToken: r.ObsoleteToken,
 		CreatedAt:     r.CreatedAt,
 		LastUsed:      r.LastUsed,
 		ClientID:      r.ClientID,
@@ -561,6 +594,7 @@ func (cli *client) fromStorageRefreshToken(r storage.RefreshToken) RefreshToken 
 			Namespace: cli.namespace,
 		},
 		Token:         r.Token,
+		ObsoleteToken: r.ObsoleteToken,
 		CreatedAt:     r.CreatedAt,
 		LastUsed:      r.LastUsed,
 		ClientID:      r.ClientID,
@@ -623,9 +657,10 @@ type OfflineSessions struct {
 	k8sapi.TypeMeta   `json:",inline"`
 	k8sapi.ObjectMeta `json:"metadata,omitempty"`
 
-	UserID  string                              `json:"userID,omitempty"`
-	ConnID  string                              `json:"connID,omitempty"`
-	Refresh map[string]*storage.RefreshTokenRef `json:"refresh,omitempty"`
+	UserID        string                              `json:"userID,omitempty"`
+	ConnID        string                              `json:"connID,omitempty"`
+	Refresh       map[string]*storage.RefreshTokenRef `json:"refresh,omitempty"`
+	ConnectorData []byte                              `json:"connectorData,omitempty"`
 }
 
 func (cli *client) fromStorageOfflineSessions(o storage.OfflineSessions) OfflineSessions {
@@ -638,17 +673,19 @@ func (cli *client) fromStorageOfflineSessions(o storage.OfflineSessions) Offline
 			Name:      cli.offlineTokenName(o.UserID, o.ConnID),
 			Namespace: cli.namespace,
 		},
-		UserID:  o.UserID,
-		ConnID:  o.ConnID,
-		Refresh: o.Refresh,
+		UserID:        o.UserID,
+		ConnID:        o.ConnID,
+		Refresh:       o.Refresh,
+		ConnectorData: o.ConnectorData,
 	}
 }
 
 func toStorageOfflineSessions(o OfflineSessions) storage.OfflineSessions {
 	s := storage.OfflineSessions{
-		UserID:  o.UserID,
-		ConnID:  o.ConnID,
-		Refresh: o.Refresh,
+		UserID:        o.UserID,
+		ConnID:        o.ConnID,
+		Refresh:       o.Refresh,
+		ConnectorData: o.ConnectorData,
 	}
 	if s.Refresh == nil {
 		// Server code assumes this will be non-nil.
@@ -663,10 +700,9 @@ type Connector struct {
 	k8sapi.TypeMeta   `json:",inline"`
 	k8sapi.ObjectMeta `json:"metadata,omitempty"`
 
-	ID              string `json:"id,omitempty"`
-	Type            string `json:"type,omitempty"`
-	Name            string `json:"name,omitempty"`
-	ResourceVersion string `json:"resourceVersion,omitempty"`
+	ID   string `json:"id,omitempty"`
+	Type string `json:"type,omitempty"`
+	Name string `json:"name,omitempty"`
 	// Config holds connector specific configuration information
 	Config []byte `json:"config,omitempty"`
 }
@@ -681,11 +717,10 @@ func (cli *client) fromStorageConnector(c storage.Connector) Connector {
 			Name:      c.ID,
 			Namespace: cli.namespace,
 		},
-		ID:              c.ID,
-		Type:            c.Type,
-		Name:            c.Name,
-		ResourceVersion: c.ResourceVersion,
-		Config:          c.Config,
+		ID:     c.ID,
+		Type:   c.Type,
+		Name:   c.Name,
+		Config: c.Config,
 	}
 }
 
@@ -694,7 +729,7 @@ func toStorageConnector(c Connector) storage.Connector {
 		ID:              c.ID,
 		Type:            c.Type,
 		Name:            c.Name,
-		ResourceVersion: c.ResourceVersion,
+		ResourceVersion: c.ObjectMeta.ResourceVersion,
 		Config:          c.Config,
 	}
 }
@@ -704,4 +739,112 @@ type ConnectorList struct {
 	k8sapi.TypeMeta `json:",inline"`
 	k8sapi.ListMeta `json:"metadata,omitempty"`
 	Connectors      []Connector `json:"items"`
+}
+
+// DeviceRequest is a mirrored struct from storage with JSON struct tags and
+// Kubernetes type metadata.
+type DeviceRequest struct {
+	k8sapi.TypeMeta   `json:",inline"`
+	k8sapi.ObjectMeta `json:"metadata,omitempty"`
+
+	DeviceCode   string    `json:"device_code,omitempty"`
+	ClientID     string    `json:"client_id,omitempty"`
+	ClientSecret string    `json:"client_secret,omitempty"`
+	Scopes       []string  `json:"scopes,omitempty"`
+	Expiry       time.Time `json:"expiry"`
+}
+
+// DeviceRequestList is a list of DeviceRequests.
+type DeviceRequestList struct {
+	k8sapi.TypeMeta `json:",inline"`
+	k8sapi.ListMeta `json:"metadata,omitempty"`
+	DeviceRequests  []DeviceRequest `json:"items"`
+}
+
+func (cli *client) fromStorageDeviceRequest(a storage.DeviceRequest) DeviceRequest {
+	req := DeviceRequest{
+		TypeMeta: k8sapi.TypeMeta{
+			Kind:       kindDeviceRequest,
+			APIVersion: cli.apiVersion,
+		},
+		ObjectMeta: k8sapi.ObjectMeta{
+			Name:      strings.ToLower(a.UserCode),
+			Namespace: cli.namespace,
+		},
+		DeviceCode:   a.DeviceCode,
+		ClientID:     a.ClientID,
+		ClientSecret: a.ClientSecret,
+		Scopes:       a.Scopes,
+		Expiry:       a.Expiry,
+	}
+	return req
+}
+
+func toStorageDeviceRequest(req DeviceRequest) storage.DeviceRequest {
+	return storage.DeviceRequest{
+		UserCode:     strings.ToUpper(req.ObjectMeta.Name),
+		DeviceCode:   req.DeviceCode,
+		ClientID:     req.ClientID,
+		ClientSecret: req.ClientSecret,
+		Scopes:       req.Scopes,
+		Expiry:       req.Expiry,
+	}
+}
+
+// DeviceToken is a mirrored struct from storage with JSON struct tags and
+// Kubernetes type metadata.
+type DeviceToken struct {
+	k8sapi.TypeMeta   `json:",inline"`
+	k8sapi.ObjectMeta `json:"metadata,omitempty"`
+
+	Status              string    `json:"status,omitempty"`
+	Token               string    `json:"token,omitempty"`
+	Expiry              time.Time `json:"expiry"`
+	LastRequestTime     time.Time `json:"last_request"`
+	PollIntervalSeconds int       `json:"poll_interval"`
+	CodeChallenge       string    `json:"code_challenge,omitempty"`
+	CodeChallengeMethod string    `json:"code_challenge_method,omitempty"`
+}
+
+// DeviceTokenList is a list of DeviceTokens.
+type DeviceTokenList struct {
+	k8sapi.TypeMeta `json:",inline"`
+	k8sapi.ListMeta `json:"metadata,omitempty"`
+	DeviceTokens    []DeviceToken `json:"items"`
+}
+
+func (cli *client) fromStorageDeviceToken(t storage.DeviceToken) DeviceToken {
+	req := DeviceToken{
+		TypeMeta: k8sapi.TypeMeta{
+			Kind:       kindDeviceToken,
+			APIVersion: cli.apiVersion,
+		},
+		ObjectMeta: k8sapi.ObjectMeta{
+			Name:      t.DeviceCode,
+			Namespace: cli.namespace,
+		},
+		Status:              t.Status,
+		Token:               t.Token,
+		Expiry:              t.Expiry,
+		LastRequestTime:     t.LastRequestTime,
+		PollIntervalSeconds: t.PollIntervalSeconds,
+		CodeChallenge:       t.PKCE.CodeChallenge,
+		CodeChallengeMethod: t.PKCE.CodeChallengeMethod,
+	}
+	return req
+}
+
+func toStorageDeviceToken(t DeviceToken) storage.DeviceToken {
+	return storage.DeviceToken{
+		DeviceCode:          t.ObjectMeta.Name,
+		Status:              t.Status,
+		Token:               t.Token,
+		Expiry:              t.Expiry,
+		LastRequestTime:     t.LastRequestTime,
+		PollIntervalSeconds: t.PollIntervalSeconds,
+		PKCE: storage.PKCE{
+			CodeChallenge:       t.CodeChallenge,
+			CodeChallengeMethod: t.CodeChallengeMethod,
+		},
+	}
 }

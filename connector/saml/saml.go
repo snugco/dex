@@ -2,24 +2,29 @@
 package saml
 
 import (
+	"bytes"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
 	"encoding/xml"
-	"errors"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/beevik/etree"
+	xrv "github.com/mattermost/xml-roundtrip-validator"
+	"github.com/pkg/errors"
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/russellhaering/goxmldsig/etreeutils"
-	"github.com/sirupsen/logrus"
 
-	"github.com/coreos/dex/connector"
+	"github.com/dexidp/dex/connector"
+	"github.com/dexidp/dex/pkg/groups"
+	"github.com/dexidp/dex/pkg/log"
 )
 
+// nolint
 const (
 	bindingRedirect = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-Redirect"
 	bindingPOST     = "urn:oasis:names:tc:SAML:2.0:bindings:HTTP-POST"
@@ -57,20 +62,9 @@ var (
 		nameIDformatTransient,
 	}
 	nameIDFormatLookup = make(map[string]string)
-)
 
-func init() {
-	suffix := func(s, sep string) string {
-		if i := strings.LastIndex(s, sep); i > 0 {
-			return s[i+1:]
-		}
-		return s
-	}
-	for _, format := range nameIDFormats {
-		nameIDFormatLookup[suffix(format, ":")] = format
-		nameIDFormatLookup[format] = format
-	}
-}
+	lookupOnce sync.Once
+)
 
 // Config represents configuration options for the SAML provider.
 type Config struct {
@@ -96,9 +90,10 @@ type Config struct {
 	// If GroupsDelim is supplied the connector assumes groups are returned as a
 	// single string instead of multiple attribute values. This delimiter will be
 	// used split the groups string.
-	GroupsDelim string `json:"groupsDelim"`
-
-	RedirectURI string `json:"redirectURI"`
+	GroupsDelim   string   `json:"groupsDelim"`
+	AllowedGroups []string `json:"allowedGroups"`
+	FilterGroups  bool     `json:"filterGroups"`
+	RedirectURI   string   `json:"redirectURI"`
 
 	// Requested format of the NameID. The NameID value is is mapped to the ID Token
 	// 'sub' claim.
@@ -125,11 +120,11 @@ func (c certStore) Certificates() (roots []*x509.Certificate, err error) {
 
 // Open validates the config and returns a connector. It does not actually
 // validate connectivity with the provider.
-func (c *Config) Open(id string, logger logrus.FieldLogger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
 	return c.openConnector(logger)
 }
 
-func (c *Config) openConnector(logger logrus.FieldLogger) (*provider, error) {
+func (c *Config) openConnector(logger log.Logger) (*provider, error) {
 	requiredFields := []struct {
 		name, val string
 	}{
@@ -153,16 +148,18 @@ func (c *Config) openConnector(logger logrus.FieldLogger) (*provider, error) {
 	}
 
 	p := &provider{
-		entityIssuer: c.EntityIssuer,
-		ssoIssuer:    c.SSOIssuer,
-		ssoURL:       c.SSOURL,
-		now:          time.Now,
-		usernameAttr: c.UsernameAttr,
-		emailAttr:    c.EmailAttr,
-		groupsAttr:   c.GroupsAttr,
-		groupsDelim:  c.GroupsDelim,
-		redirectURI:  c.RedirectURI,
-		logger:       logger,
+		entityIssuer:  c.EntityIssuer,
+		ssoIssuer:     c.SSOIssuer,
+		ssoURL:        c.SSOURL,
+		now:           time.Now,
+		usernameAttr:  c.UsernameAttr,
+		emailAttr:     c.EmailAttr,
+		groupsAttr:    c.GroupsAttr,
+		groupsDelim:   c.GroupsDelim,
+		allowedGroups: c.AllowedGroups,
+		filterGroups:  c.FilterGroups,
+		redirectURI:   c.RedirectURI,
+		logger:        logger,
 
 		nameIDPolicyFormat: c.NameIDPolicyFormat,
 	}
@@ -170,6 +167,19 @@ func (c *Config) openConnector(logger logrus.FieldLogger) (*provider, error) {
 	if p.nameIDPolicyFormat == "" {
 		p.nameIDPolicyFormat = nameIDFormatPersistent
 	} else {
+		lookupOnce.Do(func() {
+			suffix := func(s, sep string) string {
+				if i := strings.LastIndex(s, sep); i > 0 {
+					return s[i+1:]
+				}
+				return s
+			}
+			for _, format := range nameIDFormats {
+				nameIDFormatLookup[suffix(format, ":")] = format
+				nameIDFormatLookup[format] = format
+			}
+		})
+
 		if format, ok := nameIDFormatLookup[p.nameIDPolicyFormat]; ok {
 			p.nameIDPolicyFormat = format
 		} else {
@@ -184,7 +194,7 @@ func (c *Config) openConnector(logger logrus.FieldLogger) (*provider, error) {
 
 		var caData []byte
 		if c.CA != "" {
-			data, err := ioutil.ReadFile(c.CA)
+			data, err := os.ReadFile(c.CA)
 			if err != nil {
 				return nil, fmt.Errorf("read ca file: %v", err)
 			}
@@ -200,6 +210,10 @@ func (c *Config) openConnector(logger logrus.FieldLogger) (*provider, error) {
 		for {
 			block, caData = pem.Decode(caData)
 			if block == nil {
+				caData = bytes.TrimSpace(caData)
+				if len(caData) > 0 { // if there's some left, we've been given bad caData
+					return nil, fmt.Errorf("parse cert: trailing data: %q", string(caData))
+				}
 				break
 			}
 			cert, err := x509.ParseCertificate(block.Bytes)
@@ -227,20 +241,21 @@ type provider struct {
 	validator *dsig.ValidationContext
 
 	// Attribute mappings
-	usernameAttr string
-	emailAttr    string
-	groupsAttr   string
-	groupsDelim  string
+	usernameAttr  string
+	emailAttr     string
+	groupsAttr    string
+	groupsDelim   string
+	allowedGroups []string
+	filterGroups  bool
 
 	redirectURI string
 
 	nameIDPolicyFormat string
 
-	logger logrus.FieldLogger
+	logger log.Logger
 }
 
 func (p *provider) POSTData(s connector.Scopes, id string) (action, value string, err error) {
-
 	r := &authnRequest{
 		ProtocolBinding: bindingPOST,
 		ID:              id,
@@ -273,6 +288,7 @@ func (p *provider) POSTData(s connector.Scopes, id string) (action, value string
 //
 // The steps taken are:
 //
+// * Validate XML document does not contain malicious inputs.
 // * Verify signature on XML document (or verify sig on assertion elements).
 // * Verify various parts of the Assertion element. Conditions, audience, etc.
 // * Map the Assertion's attribute elements to user info.
@@ -281,6 +297,11 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 	rawResp, err := base64.StdEncoding.DecodeString(samlResponse)
 	if err != nil {
 		return ident, fmt.Errorf("decode response: %v", err)
+	}
+
+	byteReader := bytes.NewReader(rawResp)
+	if xrvErr := xrv.Validate(byteReader); xrvErr != nil {
+		return ident, errors.Wrap(xrvErr, "validating XML response")
 	}
 
 	// Root element is allowed to not be signed if the Assertion element is.
@@ -317,7 +338,7 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 
 		// Status is a required element.
 		if resp.Status == nil {
-			return ident, fmt.Errorf("Response did not contain a Status element")
+			return ident, fmt.Errorf("response did not contain a Status element")
 		}
 
 		if err = p.validateStatus(resp.Status); err != nil {
@@ -353,7 +374,7 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 	switch {
 	case subject.NameID != nil:
 		if ident.UserID = subject.NameID.Value; ident.UserID == "" {
-			return ident, fmt.Errorf("NameID element does not contain a value")
+			return ident, fmt.Errorf("element NameID does not contain a value")
 		}
 	default:
 		return ident, fmt.Errorf("subject does not contain an NameID element")
@@ -383,9 +404,14 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 		return ident, fmt.Errorf("no attribute with name %q: %s", p.usernameAttr, attributes.names())
 	}
 
-	if !s.Groups || p.groupsAttr == "" {
+	if len(p.allowedGroups) == 0 && (!s.Groups || p.groupsAttr == "") {
 		// Groups not requested or not configured. We're done.
 		return ident, nil
+	}
+
+	if len(p.allowedGroups) > 0 && (!s.Groups || p.groupsAttr == "") {
+		// allowedGroups set but no groups or groupsAttr. Disallowing.
+		return ident, fmt.Errorf("user not a member of allowed groups")
 	}
 
 	// Grab the groups.
@@ -403,11 +429,30 @@ func (p *provider) HandlePOST(s connector.Scopes, samlResponse, inResponseTo str
 		}
 		ident.Groups = groups
 	}
+
+	if len(p.allowedGroups) == 0 {
+		// No allowed groups set, just return the ident
+		return ident, nil
+	}
+
+	// Look for membership in one of the allowed groups
+	groupMatches := groups.Filter(ident.Groups, p.allowedGroups)
+
+	if len(groupMatches) == 0 {
+		// No group membership matches found, disallowing
+		return ident, fmt.Errorf("user not a member of allowed groups")
+	}
+
+	if p.filterGroups {
+		ident.Groups = groupMatches
+	}
+
+	// Otherwise, we're good
 	return ident, nil
 }
 
 // validateStatus verifies that the response has a good status code or
-// formats a human readble error based on the bad status.
+// formats a human readable error based on the bad status.
 func (p *provider) validateStatus(status *status) error {
 	// StatusCode is mandatory in the Status type
 	statusCode := status.StatusCode
@@ -435,15 +480,15 @@ func (p *provider) validateStatus(status *status) error {
 // see https://www.oasis-open.org/committees/download.php/35389/sstc-saml-profiles-errata-2.0-wd-06-diff.pdf
 //
 // Some of these fields are optional, but we're going to be strict here since
-// we have no other way of guarenteeing that this is actually the response to
+// we have no other way of guaranteeing that this is actually the response to
 // the request we expect.
 func (p *provider) validateSubject(subject *subject, inResponseTo string) error {
 	// Optional according to the spec, but again, we're going to be strict here.
 	if len(subject.SubjectConfirmations) == 0 {
-		return fmt.Errorf("Subject contained no SubjectConfrimations")
+		return fmt.Errorf("subject contained no SubjectConfirmations")
 	}
 
-	var errs []error
+	errs := make([]error, 0, len(subject.SubjectConfirmations))
 	// One of these must match our assumptions, not all.
 	for _, c := range subject.SubjectConfirmations {
 		err := func() error {
@@ -453,7 +498,7 @@ func (p *provider) validateSubject(subject *subject, inResponseTo string) error 
 
 			data := c.SubjectConfirmationData
 			if data == nil {
-				return fmt.Errorf("SubjectConfirmation contained no SubjectConfirmationData")
+				return fmt.Errorf("no SubjectConfirmationData field found in SubjectConfirmation")
 			}
 			if data.InResponseTo != inResponseTo {
 				return fmt.Errorf("expected SubjectConfirmationData InResponseTo value %q, got %q", inResponseTo, data.InResponseTo)

@@ -2,6 +2,9 @@ syntax = "proto3";
 
 package api;
 
+option java_package = "com.coreos.dex.api";
+option go_package = "github.com/dexidp/dex/api";
+
 // Client represents an OAuth2 client.
 message Client {
   string id = 1;
@@ -21,7 +24,7 @@ message CreateClientReq {
 // CreateClientResp returns the response from creating a client.
 message CreateClientResp {
   bool already_exists = 1;
-  Client client = 2; 
+  Client client = 2;
 }
 
 // DeleteClientReq is a request to delete a client.
@@ -30,9 +33,23 @@ message DeleteClientReq {
   string id = 1;
 }
 
-// DeleteClientResp determines if the client is deleted successfully. 
+// DeleteClientResp determines if the client is deleted successfully.
 message DeleteClientResp {
   bool not_found = 1;
+}
+
+// UpdateClientReq is a request to update an existing client.
+message UpdateClientReq {
+    string id = 1;
+    repeated string redirect_uris = 2;
+    repeated string trusted_peers = 3;
+    string name = 4;
+    string logo_url = 5;
+}
+
+// UpdateClientResp returns the response from updating a client.
+message UpdateClientResp {
+    bool not_found = 1;
 }
 
 // TODO(ericchiang): expand this.
@@ -66,7 +83,7 @@ message UpdatePasswordReq {
   string new_email = 4;
 }
 
-// UpdatePasswordResp returns the response from modifying an existing password. 
+// UpdatePasswordResp returns the response from modifying an existing password.
 message UpdatePasswordResp {
   bool not_found = 1;
 }
@@ -76,7 +93,7 @@ message DeletePasswordReq {
   string email = 1;
 }
 
-// DeletePasswordResp returns the response from deleting a password. 
+// DeletePasswordResp returns the response from deleting a password.
 message DeletePasswordResp {
   bool not_found = 1;
 }
@@ -128,16 +145,28 @@ message RevokeRefreshReq {
   string client_id = 2;
 }
 
-// RevokeRefreshResp determines if the refresh token is revoked successfully. 
+// RevokeRefreshResp determines if the refresh token is revoked successfully.
 message RevokeRefreshResp {
   // Set to true is refresh token was not found and token could not be revoked.
   bool not_found = 1;
+}
+
+message VerifyPasswordReq {
+  string email = 1;
+  string password = 2;
+}
+
+message VerifyPasswordResp {
+  bool verified = 1;
+  bool not_found = 2;
 }
 
 // Dex represents the dex gRPC service.
 service Dex {
   // CreateClient creates a client.
   rpc CreateClient(CreateClientReq) returns (CreateClientResp) {};
+  // UpdateClient updates an existing client
+  rpc UpdateClient(UpdateClientReq) returns (UpdateClientResp) {};
   // DeleteClient deletes the provided client.
   rpc DeleteClient(DeleteClientReq) returns (DeleteClientResp) {};
   // CreatePassword creates a password.
@@ -156,4 +185,6 @@ service Dex {
   //
   // Note that each user-client pair can have only one refresh token at a time.
   rpc RevokeRefresh(RevokeRefreshReq) returns (RevokeRefreshResp) {};
+  // VerifyPassword returns whether a password matches a hash for a specific email or not.
+  rpc VerifyPassword(VerifyPasswordReq) returns (VerifyPasswordResp) {};
 }

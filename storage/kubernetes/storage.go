@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand"
+	"net/http"
 	"strings"
 	"time"
 
-	"github.com/coreos/dex/storage"
-	"github.com/coreos/dex/storage/kubernetes/k8sapi"
-	"github.com/sirupsen/logrus"
+	"github.com/dexidp/dex/pkg/log"
+	"github.com/dexidp/dex/storage"
+	"github.com/dexidp/dex/storage/kubernetes/k8sapi"
 )
 
 const (
@@ -21,6 +23,8 @@ const (
 	kindPassword        = "Password"
 	kindOfflineSessions = "OfflineSessions"
 	kindConnector       = "Connector"
+	kindDeviceRequest   = "DeviceRequest"
+	kindDeviceToken     = "DeviceToken"
 )
 
 const (
@@ -32,17 +36,22 @@ const (
 	resourcePassword        = "passwords"
 	resourceOfflineSessions = "offlinesessionses" // Again attempts to pluralize.
 	resourceConnector       = "connectors"
+	resourceDeviceRequest   = "devicerequests"
+	resourceDeviceToken     = "devicetokens"
+)
+
+const (
+	gcResultLimit = 500
 )
 
 // Config values for the Kubernetes storage type.
 type Config struct {
 	InCluster      bool   `json:"inCluster"`
 	KubeConfigFile string `json:"kubeConfigFile"`
-	UseTPR         bool   `json:"useTPR"` // Flag option to use TPRs instead of CRDs
 }
 
 // Open returns a storage using Kubernetes third party resource.
-func (c *Config) Open(logger logrus.FieldLogger) (storage.Storage, error) {
+func (c *Config) Open(logger log.Logger) (storage.Storage, error) {
 	cli, err := c.open(logger, false)
 	if err != nil {
 		return nil, err
@@ -53,9 +62,9 @@ func (c *Config) Open(logger logrus.FieldLogger) (storage.Storage, error) {
 // open returns a kubernetes client, initializing the third party resources used
 // by dex.
 //
-// errOnResources controls if errors creating the resources cause this method to return
+// waitForResources controls if errors creating the resources cause this method to return
 // immediately (used during testing), or if the client will asynchronously retry.
-func (c *Config) open(logger logrus.FieldLogger, errOnResources bool) (*client, error) {
+func (c *Config) open(logger log.Logger, waitForResources bool) (*client, error) {
 	if c.InCluster && (c.KubeConfigFile != "") {
 		return nil, errors.New("cannot specify both 'inCluster' and 'kubeConfigFile'")
 	}
@@ -78,16 +87,20 @@ func (c *Config) open(logger logrus.FieldLogger, errOnResources bool) (*client, 
 		return nil, err
 	}
 
-	cli, err := newClient(cluster, user, namespace, logger, c.UseTPR)
+	cli, err := newClient(cluster, user, namespace, logger, c.InCluster)
 	if err != nil {
 		return nil, fmt.Errorf("create client: %v", err)
+	}
+
+	if err = cli.detectKubernetesVersion(); err != nil {
+		return nil, fmt.Errorf("cannot get kubernetes version: %v", err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	logger.Info("creating custom Kubernetes resources")
-	if !cli.registerCustomResources(c.UseTPR) {
-		if errOnResources {
+	if !cli.registerCustomResources() {
+		if waitForResources {
 			cancel()
 			return nil, fmt.Errorf("failed creating custom resources")
 		}
@@ -95,10 +108,9 @@ func (c *Config) open(logger logrus.FieldLogger, errOnResources bool) (*client, 
 		// Try to synchronously create the custom resources once. This doesn't mean
 		// they'll immediately be available, but ensures that the client will actually try
 		// once.
-		logger.Errorf("failed creating custom resources: %v", err)
 		go func() {
 			for {
-				if cli.registerCustomResources(c.UseTPR) {
+				if cli.registerCustomResources() {
 					return
 				}
 
@@ -111,6 +123,13 @@ func (c *Config) open(logger logrus.FieldLogger, errOnResources bool) (*client, 
 		}()
 	}
 
+	if waitForResources {
+		if err := cli.waitForCRDs(ctx); err != nil {
+			cancel()
+			return nil, err
+		}
+	}
+
 	// If the client is closed, stop trying to create resources.
 	cli.cancel = cancel
 	return cli, nil
@@ -118,34 +137,32 @@ func (c *Config) open(logger logrus.FieldLogger, errOnResources bool) (*client, 
 
 // registerCustomResources attempts to create the custom resources dex
 // requires or identifies that they're already enabled. This function creates
-// third party resources(TPRs) or custom resource definitions(CRDs) depending
-// on the `useTPR` flag passed in as an argument.
+// custom resource definitions(CRDs)
 // It logs all errors, returning true if the resources were created successfully.
 //
 // Creating a custom resource does not mean that they'll be immediately available.
-//
-// TODO(ericchiang): Provide an option to wait for the resources to actually
-// be available.
-func (cli *client) registerCustomResources(useTPR bool) (ok bool) {
+func (cli *client) registerCustomResources() (ok bool) {
 	ok = true
-	length := len(customResourceDefinitions)
-	if useTPR {
-		length = len(thirdPartyResources)
-	}
+
+	definitions := customResourceDefinitions(cli.crdAPIVersion)
+	length := len(definitions)
 
 	for i := 0; i < length; i++ {
 		var err error
 		var resourceName string
 
-		if useTPR {
-			r := thirdPartyResources[i]
-			err = cli.postResource("extensions/v1beta1", "", "thirdpartyresources", r)
-			resourceName = r.ObjectMeta.Name
+		r := definitions[i]
+		var i interface{}
+		cli.logger.Infof("checking if custom resource %s has already been created...", r.ObjectMeta.Name)
+		if err := cli.list(r.Spec.Names.Plural, &i); err == nil {
+			cli.logger.Infof("The custom resource %s already available, skipping create", r.ObjectMeta.Name)
+			continue
 		} else {
-			r := customResourceDefinitions[i]
-			err = cli.postResource("apiextensions.k8s.io/v1beta1", "", "customresourcedefinitions", r)
-			resourceName = r.ObjectMeta.Name
+			cli.logger.Infof("failed to list custom resource %s, attempting to create: %v", r.ObjectMeta.Name, err)
 		}
+
+		err = cli.postResource(cli.crdAPIVersion, "", "customresourcedefinitions", r)
+		resourceName = r.ObjectMeta.Name
 
 		if err != nil {
 			switch err {
@@ -163,6 +180,49 @@ func (cli *client) registerCustomResources(useTPR bool) (ok bool) {
 		cli.logger.Errorf("create custom resource %s", resourceName)
 	}
 	return ok
+}
+
+// waitForCRDs waits for all CRDs to be in a ready state, and is used
+// by the tests to synchronize before running conformance.
+func (cli *client) waitForCRDs(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Second*30)
+	defer cancel()
+
+	for _, crd := range customResourceDefinitions(cli.crdAPIVersion) {
+		for {
+			err := cli.isCRDReady(crd.Name)
+			if err == nil {
+				break
+			}
+
+			cli.logger.Errorf("checking CRD: %v", err)
+
+			select {
+			case <-ctx.Done():
+				return errors.New("timed out waiting for CRDs to be available")
+			case <-time.After(time.Millisecond * 100):
+			}
+		}
+	}
+	return nil
+}
+
+// isCRDReady determines if a CRD is ready by inspecting its conditions.
+func (cli *client) isCRDReady(name string) error {
+	var r k8sapi.CustomResourceDefinition
+	err := cli.getResource(cli.crdAPIVersion, "", "customresourcedefinitions", name, &r)
+	if err != nil {
+		return fmt.Errorf("get crd %s: %v", name, err)
+	}
+
+	conds := make(map[string]string) // For debugging, keep the conditions around.
+	for _, c := range r.Status.Conditions {
+		if c.Type == k8sapi.Established && c.Status == k8sapi.ConditionTrue {
+			return nil
+		}
+		conds[string(c.Type)] = string(c.Status)
+	}
+	return fmt.Errorf("crd %s not ready %#v", name, conds)
 }
 
 func (cli *client) Close() error {
@@ -356,7 +416,7 @@ func (cli *client) DeleteAuthCode(code string) error {
 }
 
 func (cli *client) DeleteClient(id string) error {
-	// Check for hash collition.
+	// Check for hash collision.
 	c, err := cli.getClient(id)
 	if err != nil {
 		return err
@@ -369,7 +429,7 @@ func (cli *client) DeleteRefresh(id string) error {
 }
 
 func (cli *client) DeletePassword(email string) error {
-	// Check for hash collition.
+	// Check for hash collision.
 	p, err := cli.getPassword(email)
 	if err != nil {
 		return err
@@ -378,7 +438,7 @@ func (cli *client) DeletePassword(email string) error {
 }
 
 func (cli *client) DeleteOfflineSessions(userID string, connID string) error {
-	// Check for hash collition.
+	// Check for hash collision.
 	o, err := cli.getOfflineSessions(userID, connID)
 	if err != nil {
 		return err
@@ -391,19 +451,21 @@ func (cli *client) DeleteConnector(id string) error {
 }
 
 func (cli *client) UpdateRefreshToken(id string, updater func(old storage.RefreshToken) (storage.RefreshToken, error)) error {
-	r, err := cli.getRefreshToken(id)
-	if err != nil {
-		return err
-	}
-	updated, err := updater(toStorageRefreshToken(r))
-	if err != nil {
-		return err
-	}
-	updated.ID = id
+	return retryOnConflict(context.TODO(), func() error {
+		r, err := cli.getRefreshToken(id)
+		if err != nil {
+			return err
+		}
+		updated, err := updater(toStorageRefreshToken(r))
+		if err != nil {
+			return err
+		}
+		updated.ID = id
 
-	newToken := cli.fromStorageRefreshToken(updated)
-	newToken.ObjectMeta = r.ObjectMeta
-	return cli.put(resourceRefreshToken, r.ObjectMeta.Name, newToken)
+		newToken := cli.fromStorageRefreshToken(updated)
+		newToken.ObjectMeta = r.ObjectMeta
+		return cli.put(resourceRefreshToken, r.ObjectMeta.Name, newToken)
+	})
 }
 
 func (cli *client) UpdateClient(id string, updater func(old storage.Client) (storage.Client, error)) error {
@@ -441,19 +503,21 @@ func (cli *client) UpdatePassword(email string, updater func(old storage.Passwor
 }
 
 func (cli *client) UpdateOfflineSessions(userID string, connID string, updater func(old storage.OfflineSessions) (storage.OfflineSessions, error)) error {
-	o, err := cli.getOfflineSessions(userID, connID)
-	if err != nil {
-		return err
-	}
+	return retryOnConflict(context.TODO(), func() error {
+		o, err := cli.getOfflineSessions(userID, connID)
+		if err != nil {
+			return err
+		}
 
-	updated, err := updater(toStorageOfflineSessions(o))
-	if err != nil {
-		return err
-	}
+		updated, err := updater(toStorageOfflineSessions(o))
+		if err != nil {
+			return err
+		}
 
-	newOfflineSessions := cli.fromStorageOfflineSessions(updated)
-	newOfflineSessions.ObjectMeta = o.ObjectMeta
-	return cli.put(resourceOfflineSessions, o.ObjectMeta.Name, newOfflineSessions)
+		newOfflineSessions := cli.fromStorageOfflineSessions(updated)
+		newOfflineSessions.ObjectMeta = o.ObjectMeta
+		return cli.put(resourceOfflineSessions, o.ObjectMeta.Name, newOfflineSessions)
+	})
 }
 
 func (cli *client) UpdateKeys(updater func(old storage.Keys) (storage.Keys, error)) error {
@@ -465,6 +529,7 @@ func (cli *client) UpdateKeys(updater func(old storage.Keys) (storage.Keys, erro
 		}
 		firstUpdate = true
 	}
+
 	var oldKeys storage.Keys
 	if !firstUpdate {
 		oldKeys = toStorageKeys(keys)
@@ -474,12 +539,30 @@ func (cli *client) UpdateKeys(updater func(old storage.Keys) (storage.Keys, erro
 	if err != nil {
 		return err
 	}
+
 	newKeys := cli.fromStorageKeys(updated)
 	if firstUpdate {
-		return cli.post(resourceKeys, newKeys)
+		err = cli.post(resourceKeys, newKeys)
+		if err != nil && errors.Is(err, storage.ErrAlreadyExists) {
+			// We need to tolerate conflicts here in case of HA mode.
+			cli.logger.Debugf("Keys creation failed: %v. It is possible that keys have already been created by another dex instance.", err)
+			return errors.New("keys already created by another server instance")
+		}
+
+		return err
 	}
+
 	newKeys.ObjectMeta = keys.ObjectMeta
-	return cli.put(resourceKeys, keysName, newKeys)
+
+	err = cli.put(resourceKeys, keysName, newKeys)
+	if isKubernetesAPIConflictError(err) {
+		// We need to tolerate conflicts here in case of HA mode.
+		// Dex instances run keys rotation at the same time because they use SigningKey.nextRotation CR field as a trigger.
+		cli.logger.Debugf("Keys rotation failed: %v. It is possible that keys have already been rotated by another dex instance.", err)
+		return errors.New("keys already rotated by another server instance")
+	}
+
+	return err
 }
 
 func (cli *client) UpdateAuthRequest(id string, updater func(a storage.AuthRequest) (storage.AuthRequest, error)) error {
@@ -500,25 +583,27 @@ func (cli *client) UpdateAuthRequest(id string, updater func(a storage.AuthReque
 }
 
 func (cli *client) UpdateConnector(id string, updater func(a storage.Connector) (storage.Connector, error)) error {
-	var c Connector
-	err := cli.get(resourceConnector, id, &c)
-	if err != nil {
-		return err
-	}
+	return retryOnConflict(context.TODO(), func() error {
+		var c Connector
+		err := cli.get(resourceConnector, id, &c)
+		if err != nil {
+			return err
+		}
 
-	updated, err := updater(toStorageConnector(c))
-	if err != nil {
-		return err
-	}
+		updated, err := updater(toStorageConnector(c))
+		if err != nil {
+			return err
+		}
 
-	newConn := cli.fromStorageConnector(updated)
-	newConn.ObjectMeta = c.ObjectMeta
-	return cli.put(resourceConnector, id, newConn)
+		newConn := cli.fromStorageConnector(updated)
+		newConn.ObjectMeta = c.ObjectMeta
+		return cli.put(resourceConnector, id, newConn)
+	})
 }
 
 func (cli *client) GarbageCollect(now time.Time) (result storage.GCResult, err error) {
 	var authRequests AuthRequestList
-	if err := cli.list(resourceAuthRequest, &authRequests); err != nil {
+	if err := cli.listN(resourceAuthRequest, &authRequests, gcResultLimit); err != nil {
 		return result, fmt.Errorf("failed to list auth requests: %v", err)
 	}
 
@@ -537,7 +622,7 @@ func (cli *client) GarbageCollect(now time.Time) (result storage.GCResult, err e
 	}
 
 	var authCodes AuthCodeList
-	if err := cli.list(resourceAuthCode, &authCodes); err != nil {
+	if err := cli.listN(resourceAuthCode, &authCodes, gcResultLimit); err != nil {
 		return result, fmt.Errorf("failed to list auth codes: %v", err)
 	}
 
@@ -550,5 +635,126 @@ func (cli *client) GarbageCollect(now time.Time) (result storage.GCResult, err e
 			result.AuthCodes++
 		}
 	}
+
+	var deviceRequests DeviceRequestList
+	if err := cli.listN(resourceDeviceRequest, &deviceRequests, gcResultLimit); err != nil {
+		return result, fmt.Errorf("failed to list device requests: %v", err)
+	}
+
+	for _, deviceRequest := range deviceRequests.DeviceRequests {
+		if now.After(deviceRequest.Expiry) {
+			if err := cli.delete(resourceDeviceRequest, deviceRequest.ObjectMeta.Name); err != nil {
+				cli.logger.Errorf("failed to delete device request: %v", err)
+				delErr = fmt.Errorf("failed to delete device request: %v", err)
+			}
+			result.DeviceRequests++
+		}
+	}
+
+	var deviceTokens DeviceTokenList
+	if err := cli.listN(resourceDeviceToken, &deviceTokens, gcResultLimit); err != nil {
+		return result, fmt.Errorf("failed to list device tokens: %v", err)
+	}
+
+	for _, deviceToken := range deviceTokens.DeviceTokens {
+		if now.After(deviceToken.Expiry) {
+			if err := cli.delete(resourceDeviceToken, deviceToken.ObjectMeta.Name); err != nil {
+				cli.logger.Errorf("failed to delete device token: %v", err)
+				delErr = fmt.Errorf("failed to delete device token: %v", err)
+			}
+			result.DeviceTokens++
+		}
+	}
+
+	if delErr != nil {
+		return result, delErr
+	}
 	return result, delErr
+}
+
+func (cli *client) CreateDeviceRequest(d storage.DeviceRequest) error {
+	return cli.post(resourceDeviceRequest, cli.fromStorageDeviceRequest(d))
+}
+
+func (cli *client) GetDeviceRequest(userCode string) (storage.DeviceRequest, error) {
+	var req DeviceRequest
+	if err := cli.get(resourceDeviceRequest, strings.ToLower(userCode), &req); err != nil {
+		return storage.DeviceRequest{}, err
+	}
+	return toStorageDeviceRequest(req), nil
+}
+
+func (cli *client) CreateDeviceToken(t storage.DeviceToken) error {
+	return cli.post(resourceDeviceToken, cli.fromStorageDeviceToken(t))
+}
+
+func (cli *client) GetDeviceToken(deviceCode string) (storage.DeviceToken, error) {
+	var token DeviceToken
+	if err := cli.get(resourceDeviceToken, deviceCode, &token); err != nil {
+		return storage.DeviceToken{}, err
+	}
+	return toStorageDeviceToken(token), nil
+}
+
+func (cli *client) getDeviceToken(deviceCode string) (t DeviceToken, err error) {
+	err = cli.get(resourceDeviceToken, deviceCode, &t)
+	return
+}
+
+func (cli *client) UpdateDeviceToken(deviceCode string, updater func(old storage.DeviceToken) (storage.DeviceToken, error)) error {
+	return retryOnConflict(context.TODO(), func() error {
+		r, err := cli.getDeviceToken(deviceCode)
+		if err != nil {
+			return err
+		}
+		updated, err := updater(toStorageDeviceToken(r))
+		if err != nil {
+			return err
+		}
+		updated.DeviceCode = deviceCode
+
+		newToken := cli.fromStorageDeviceToken(updated)
+		newToken.ObjectMeta = r.ObjectMeta
+		return cli.put(resourceDeviceToken, r.ObjectMeta.Name, newToken)
+	})
+}
+
+func isKubernetesAPIConflictError(err error) bool {
+	if httpErr, ok := err.(httpError); ok {
+		if httpErr.StatusCode() == http.StatusConflict {
+			return true
+		}
+	}
+	return false
+}
+
+func retryOnConflict(ctx context.Context, action func() error) error {
+	policy := []int{10, 20, 100, 300, 600}
+
+	attempts := 0
+	getNextStep := func() time.Duration {
+		step := policy[attempts]
+		return time.Duration(step*5+rand.Intn(step)) * time.Microsecond
+	}
+
+	if err := action(); err == nil || !isKubernetesAPIConflictError(err) {
+		return err
+	}
+
+	for {
+		select {
+		case <-time.After(getNextStep()):
+			err := action()
+			if err == nil || !isKubernetesAPIConflictError(err) {
+				return err
+			}
+
+			attempts++
+			if attempts >= 4 {
+				return fmt.Errorf("maximum timeout reached while retrying a conflicted request: %w", err)
+			}
+		case <-ctx.Done():
+			return errors.New("canceled")
+		}
+	}
 }

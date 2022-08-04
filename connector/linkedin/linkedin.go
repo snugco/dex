@@ -5,18 +5,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 
 	"golang.org/x/oauth2"
 
-	"github.com/coreos/dex/connector"
-	"github.com/sirupsen/logrus"
+	"github.com/dexidp/dex/connector"
+	"github.com/dexidp/dex/pkg/log"
 )
 
 const (
-	apiURL   = "https://api.linkedin.com/v1"
+	apiURL   = "https://api.linkedin.com/v2"
 	authURL  = "https://www.linkedin.com/oauth/v2/authorization"
 	tokenURL = "https://www.linkedin.com/oauth/v2/accessToken"
 )
@@ -29,7 +29,7 @@ type Config struct {
 }
 
 // Open returns a strategy for logging in through LinkedIn
-func (c *Config) Open(id string, logger logrus.FieldLogger) (connector.Connector, error) {
+func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error) {
 	return &linkedInConnector{
 		oauth2Config: &oauth2.Config{
 			ClientID:     c.ClientID,
@@ -38,7 +38,7 @@ func (c *Config) Open(id string, logger logrus.FieldLogger) (connector.Connector
 				AuthURL:  authURL,
 				TokenURL: tokenURL,
 			},
-			Scopes:      []string{"r_basicprofile", "r_emailaddress"},
+			Scopes:      []string{"r_liteprofile", "r_emailaddress"},
 			RedirectURL: c.RedirectURI,
 		},
 		logger: logger,
@@ -51,7 +51,7 @@ type connectorData struct {
 
 type linkedInConnector struct {
 	oauth2Config *oauth2.Config
-	logger       logrus.FieldLogger
+	logger       log.Logger
 }
 
 // LinkedIn doesn't provide refresh tokens, so refresh tokens issued by Dex
@@ -91,8 +91,8 @@ func (c *linkedInConnector) HandleCallback(s connector.Scopes, r *http.Request) 
 	}
 
 	identity = connector.Identity{
-		UserID:        profile.Alias,
-		Username:      profile.Alias + "," + profile.FirstName + "," + profile.LastName,
+		UserID:        profile.ID,
+		Username:      profile.fullname(),
 		Email:         profile.Email,
 		EmailVerified: true,
 	}
@@ -132,13 +132,18 @@ func (c *linkedInConnector) Refresh(ctx context.Context, s connector.Scopes, ide
 }
 
 type profile struct {
-	ID               string `json:"id"`
-	Name             string `json:"formattedName"`
-	FirstName        string `json:"firstName"`
-	LastName         string `json:"lastName"`
-	PublicProfileURL string `json:"publicProfileUrl"`
-	Alias            string
-	Email            string `json:"emailAddress"`
+	ID        string `json:"id"`
+	FirstName string `json:"localizedFirstName"`
+	LastName  string `json:"localizedLastName"`
+	Email     string `json:"emailAddress"`
+}
+
+type emailresp struct {
+	Elements []struct {
+		Handle struct {
+			EmailAddress string `json:"emailAddress"`
+		} `json:"handle~"`
+	} `json:"elements"`
 }
 
 // fullname returns a full name of a person, or email if the resulting name is
@@ -152,15 +157,50 @@ func (p profile) fullname() string {
 	return fname
 }
 
+func (c *linkedInConnector) primaryEmail(ctx context.Context, client *http.Client) (email string, err error) {
+	req, err := http.NewRequest("GET", apiURL+"/emailAddress?q=members&projection=(elements*(handle~))", nil)
+	if err != nil {
+		return email, fmt.Errorf("new req: %v", err)
+	}
+
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		return email, fmt.Errorf("get URL %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return email, fmt.Errorf("read body: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return email, fmt.Errorf("%s: %s", resp.Status, body)
+	}
+
+	var parsedResp emailresp
+	err = json.Unmarshal(body, &parsedResp)
+	if err == nil {
+		for _, elem := range parsedResp.Elements {
+			email = elem.Handle.EmailAddress
+		}
+	}
+
+	if email == "" {
+		err = fmt.Errorf("email is not set")
+	}
+
+	return email, err
+}
+
 func (c *linkedInConnector) profile(ctx context.Context, client *http.Client) (p profile, err error) {
-	// https://developer.linkedin.com/docs/fields/basic-profile
-	req, err := http.NewRequest("GET", apiURL+"/people/~:(id,first-name,last-name,email-address,public-profile-url)", nil)
+	// https://docs.microsoft.com/en-us/linkedin/shared/integrations/people/profile-api
+	// https://docs.microsoft.com/en-us/linkedin/shared/integrations/people/primary-contact-api
+	// https://docs.microsoft.com/en-us/linkedin/consumer/integrations/self-serve/migration-faq#how-do-i-retrieve-the-members-email-address
+	req, err := http.NewRequest("GET", apiURL+"/me", nil)
 	if err != nil {
 		return p, fmt.Errorf("new req: %v", err)
 	}
-	q := req.URL.Query()
-	q.Add("format", "json")
-	req.URL.RawQuery = q.Encode()
 
 	resp, err := client.Do(req.WithContext(ctx))
 	if err != nil {
@@ -169,7 +209,7 @@ func (c *linkedInConnector) profile(ctx context.Context, client *http.Client) (p
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return p, fmt.Errorf("read body: %v", err)
 		}
@@ -180,11 +220,12 @@ func (c *linkedInConnector) profile(ctx context.Context, client *http.Client) (p
 		return p, fmt.Errorf("JSON decode: %v", err)
 	}
 
-	if p.Email == "" {
-		return p, fmt.Errorf("email is not set")
+	email, err := c.primaryEmail(ctx, client)
+	if err != nil {
+		return p, fmt.Errorf("fetching email: %v", err)
 	}
-	lastBin := strings.LastIndex(p.PublicProfileURL, "/")
-	p.Alias = p.PublicProfileURL[lastBin+1 : len(p.PublicProfileURL)]
+	p.Email = email
+
 	return p, err
 }
 

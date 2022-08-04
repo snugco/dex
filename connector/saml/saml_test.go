@@ -5,7 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
-	"io/ioutil"
+	"os"
 	"sort"
 	"testing"
 	"time"
@@ -14,7 +14,7 @@ import (
 	dsig "github.com/russellhaering/goxmldsig"
 	"github.com/sirupsen/logrus"
 
-	"github.com/coreos/dex/connector"
+	"github.com/dexidp/dex/connector"
 )
 
 // responseTest maps a SAML 2.0 response object to a set of expected values.
@@ -49,9 +49,11 @@ type responseTest struct {
 	entityIssuer string
 
 	// Attribute customization.
-	usernameAttr string
-	emailAttr    string
-	groupsAttr   string
+	usernameAttr  string
+	emailAttr     string
+	groupsAttr    string
+	allowedGroups []string
+	filterGroups  bool
 
 	// Expected outcome of the test.
 	wantErr   bool
@@ -93,6 +95,119 @@ func TestGroups(t *testing.T) {
 			Email:         "eric.chiang+okta@coreos.com",
 			EmailVerified: true,
 			Groups:        []string{"Admins", "Everyone"},
+		},
+	}
+	test.run(t)
+}
+
+func TestGroupsWhitelist(t *testing.T) {
+	test := responseTest{
+		caFile:        "testdata/ca.crt",
+		respFile:      "testdata/good-resp.xml",
+		now:           "2017-04-04T04:34:59.330Z",
+		usernameAttr:  "Name",
+		emailAttr:     "email",
+		groupsAttr:    "groups",
+		allowedGroups: []string{"Admins"},
+		inResponseTo:  "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:   "http://127.0.0.1:5556/dex/callback",
+		wantIdent: connector.Identity{
+			UserID:        "eric.chiang+okta@coreos.com",
+			Username:      "Eric",
+			Email:         "eric.chiang+okta@coreos.com",
+			EmailVerified: true,
+			Groups:        []string{"Admins", "Everyone"},
+		},
+	}
+	test.run(t)
+}
+
+func TestGroupsWhitelistWithFiltering(t *testing.T) {
+	test := responseTest{
+		caFile:        "testdata/ca.crt",
+		respFile:      "testdata/good-resp.xml",
+		now:           "2017-04-04T04:34:59.330Z",
+		usernameAttr:  "Name",
+		emailAttr:     "email",
+		groupsAttr:    "groups",
+		allowedGroups: []string{"Admins"},
+		filterGroups:  true,
+		inResponseTo:  "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:   "http://127.0.0.1:5556/dex/callback",
+		wantIdent: connector.Identity{
+			UserID:        "eric.chiang+okta@coreos.com",
+			Username:      "Eric",
+			Email:         "eric.chiang+okta@coreos.com",
+			EmailVerified: true,
+			Groups:        []string{"Admins"}, // "Everyone" is filtered
+		},
+	}
+	test.run(t)
+}
+
+func TestGroupsWhitelistEmpty(t *testing.T) {
+	test := responseTest{
+		caFile:        "testdata/ca.crt",
+		respFile:      "testdata/good-resp.xml",
+		now:           "2017-04-04T04:34:59.330Z",
+		usernameAttr:  "Name",
+		emailAttr:     "email",
+		groupsAttr:    "groups",
+		allowedGroups: []string{},
+		inResponseTo:  "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:   "http://127.0.0.1:5556/dex/callback",
+		wantIdent: connector.Identity{
+			UserID:        "eric.chiang+okta@coreos.com",
+			Username:      "Eric",
+			Email:         "eric.chiang+okta@coreos.com",
+			EmailVerified: true,
+			Groups:        []string{"Admins", "Everyone"},
+		},
+	}
+	test.run(t)
+}
+
+func TestGroupsWhitelistDisallowed(t *testing.T) {
+	test := responseTest{
+		wantErr:       true,
+		caFile:        "testdata/ca.crt",
+		respFile:      "testdata/good-resp.xml",
+		now:           "2017-04-04T04:34:59.330Z",
+		usernameAttr:  "Name",
+		emailAttr:     "email",
+		groupsAttr:    "groups",
+		allowedGroups: []string{"Nope"},
+		inResponseTo:  "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:   "http://127.0.0.1:5556/dex/callback",
+		wantIdent: connector.Identity{
+			UserID:        "eric.chiang+okta@coreos.com",
+			Username:      "Eric",
+			Email:         "eric.chiang+okta@coreos.com",
+			EmailVerified: true,
+			Groups:        []string{"Admins", "Everyone"},
+		},
+	}
+	test.run(t)
+}
+
+func TestGroupsWhitelistDisallowedNoGroupsOnIdent(t *testing.T) {
+	test := responseTest{
+		wantErr:       true,
+		caFile:        "testdata/ca.crt",
+		respFile:      "testdata/good-resp.xml",
+		now:           "2017-04-04T04:34:59.330Z",
+		usernameAttr:  "Name",
+		emailAttr:     "email",
+		groupsAttr:    "groups",
+		allowedGroups: []string{"Nope"},
+		inResponseTo:  "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:   "http://127.0.0.1:5556/dex/callback",
+		wantIdent: connector.Identity{
+			UserID:        "eric.chiang+okta@coreos.com",
+			Username:      "Eric",
+			Email:         "eric.chiang+okta@coreos.com",
+			EmailVerified: true,
+			Groups:        []string{},
 		},
 	}
 	test.run(t)
@@ -262,8 +377,22 @@ func TestTwoAssertionFirstSigned(t *testing.T) {
 	test.run(t)
 }
 
+func TestTamperedResponseNameID(t *testing.T) {
+	test := responseTest{
+		caFile:       "testdata/ca.crt",
+		respFile:     "testdata/tampered-resp.xml",
+		now:          "2017-04-04T04:34:59.330Z",
+		usernameAttr: "Name",
+		emailAttr:    "email",
+		inResponseTo: "6zmm5mguyebwvajyf2sdwwcw6m",
+		redirectURI:  "http://127.0.0.1:5556/dex/callback",
+		wantErr:      true,
+	}
+	test.run(t)
+}
+
 func loadCert(ca string) (*x509.Certificate, error) {
-	data, err := ioutil.ReadFile(ca)
+	data, err := os.ReadFile(ca)
 	if err != nil {
 		return nil, err
 	}
@@ -276,12 +405,14 @@ func loadCert(ca string) (*x509.Certificate, error) {
 
 func (r responseTest) run(t *testing.T) {
 	c := Config{
-		CA:           r.caFile,
-		UsernameAttr: r.usernameAttr,
-		EmailAttr:    r.emailAttr,
-		GroupsAttr:   r.groupsAttr,
-		RedirectURI:  r.redirectURI,
-		EntityIssuer: r.entityIssuer,
+		CA:            r.caFile,
+		UsernameAttr:  r.usernameAttr,
+		EmailAttr:     r.emailAttr,
+		GroupsAttr:    r.groupsAttr,
+		RedirectURI:   r.redirectURI,
+		EntityIssuer:  r.entityIssuer,
+		AllowedGroups: r.allowedGroups,
+		FilterGroups:  r.filterGroups,
 		// Never logging in, don't need this.
 		SSOURL: "http://foo.bar/",
 	}
@@ -295,7 +426,7 @@ func (r responseTest) run(t *testing.T) {
 		t.Fatal(err)
 	}
 	conn.now = func() time.Time { return now }
-	resp, err := ioutil.ReadFile(r.respFile)
+	resp, err := os.ReadFile(r.respFile)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,13 +454,92 @@ func (r responseTest) run(t *testing.T) {
 	}
 }
 
-const (
-	defaultSSOIssuer   = "http://www.okta.com/exk91cb99lKkKSYoy0h7"
-	defaultRedirectURI = "http://localhost:5556/dex/callback"
+func TestConfigCAData(t *testing.T) {
+	logger := logrus.New()
+	validPEM, err := os.ReadFile("testdata/ca.crt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid2ndPEM, err := os.ReadFile("testdata/okta-ca.pem")
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	// Response ID embedded in our testdata.
-	testDataResponseID = "_fd1b3ef9-ec09-44a7-a66b-0d39c250f6a0"
-)
+	// copy helper, avoid messing with the byte slice among different cases
+	c := func(bs []byte) []byte {
+		return append([]byte(nil), bs...)
+	}
+
+	tests := []struct {
+		name    string
+		caData  []byte
+		wantErr bool
+	}{
+		{
+			name:   "one valid PEM entry",
+			caData: c(validPEM),
+		},
+		{
+			name:   "one valid PEM entry with trailing newline",
+			caData: append(c(validPEM), []byte("\n")...),
+		},
+		{
+			name:   "one valid PEM entry with trailing spaces",
+			caData: append(c(validPEM), []byte("   ")...),
+		},
+		{
+			name:   "one valid PEM entry with two trailing newlines",
+			caData: append(c(validPEM), []byte("\n\n")...),
+		},
+		{
+			name:   "two valid PEM entries",
+			caData: append(c(validPEM), c(valid2ndPEM)...),
+		},
+		{
+			name:   "two valid PEM entries with newline in between",
+			caData: append(append(c(validPEM), []byte("\n")...), c(valid2ndPEM)...),
+		},
+		{
+			name:   "two valid PEM entries with trailing newline",
+			caData: append(c(valid2ndPEM), append(c(validPEM), []byte("\n")...)...),
+		},
+		{
+			name:    "empty",
+			caData:  []byte{},
+			wantErr: true,
+		},
+		{
+			name:    "one valid PEM entry with trailing data",
+			caData:  append(c(validPEM), []byte("yaddayadda")...),
+			wantErr: true,
+		},
+		{
+			name:    "one valid PEM entry with bad data before",
+			caData:  append([]byte("yaddayadda"), c(validPEM)...),
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			c := Config{
+				CAData:       tc.caData,
+				UsernameAttr: "user",
+				EmailAttr:    "email",
+				RedirectURI:  "http://127.0.0.1:5556/dex/callback",
+				SSOURL:       "http://foo.bar/",
+			}
+			_, err := (&c).Open("samltest", logger)
+			if tc.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+			} else if err != nil {
+				t.Errorf("expected no error, got %v", err)
+			}
+		})
+	}
+}
 
 // Deprecated: Use testing framework established above.
 func runVerify(t *testing.T, ca string, resp string, shouldSucceed bool) {
@@ -341,7 +551,7 @@ func runVerify(t *testing.T, ca string, resp string, shouldSucceed bool) {
 
 	validator := dsig.NewDefaultValidationContext(s)
 
-	data, err := ioutil.ReadFile(resp)
+	data, err := os.ReadFile(resp)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -352,29 +562,8 @@ func runVerify(t *testing.T, ca string, resp string, shouldSucceed bool) {
 		}
 	} else {
 		if !shouldSucceed {
-			t.Fatalf("expected an invalid signatrue but verification has been successful")
+			t.Fatalf("expected an invalid signature but verification has been successful")
 		}
-	}
-}
-
-// Deprecated: Use testing framework established above.
-func newProvider(ssoIssuer string, redirectURI string) *provider {
-	if ssoIssuer == "" {
-		ssoIssuer = defaultSSOIssuer
-	}
-	if redirectURI == "" {
-		redirectURI = defaultRedirectURI
-	}
-	now, _ := time.Parse(time.RFC3339, "2017-01-24T20:48:41Z")
-	timeFunc := func() time.Time { return now }
-	return &provider{
-		ssoIssuer:    ssoIssuer,
-		ssoURL:       "http://idp.org/saml/sso",
-		now:          timeFunc,
-		usernameAttr: "user",
-		emailAttr:    "email",
-		redirectURI:  redirectURI,
-		logger:       logrus.New(),
 	}
 }
 

@@ -1,6 +1,6 @@
 # Running a Dex gRPC client
 
-Using gRPC, a client application can directly call methods on a server application as if it was a local object. The schema for Dex's gRPC API calls is defined in [`api/api.proto`][api-proto]. [`client.go`][client] is an example client program that makes a bunch of API calls to the dex server. For further details on the Dex API refer [`Documentation/api.md`][api-docs].
+Using gRPC, a client application can directly call methods on a server application as if it was a local object. The schema for Dex's gRPC API calls is defined in [`api/api.proto`][api-proto]. [`client.go`][client] is an example client program that makes a bunch of API calls to the dex server. For further details on the Dex API refer the [documentation][https://dexidp.io/docs/api/].
 
 ## Generating Credentials
 
@@ -48,7 +48,8 @@ Finally run the Dex client providing the CA certificate, client certificate and 
 Running the gRPC client will cause the following API calls to be made to the server
 1. CreatePassword
 2. ListPasswords
-3. DeletePassword
+3. VerifyPassword
+4. DeletePassword
 
 ## Cleaning up
 
@@ -59,4 +60,3 @@ Run the following command to destroy all the credentials files that were created
 ```
 [api-proto]: ../../api/api.proto
 [client]: client.go
-[api-docs]: ../../Documentation/api.md

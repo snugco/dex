@@ -6,12 +6,11 @@ import (
 	"regexp"
 	"time"
 
-	"github.com/cockroachdb/cockroach-go/crdb"
-	"github.com/sirupsen/logrus"
-
 	// import third party drivers
-	_ "github.com/go-sql-driver/mysql"
 	_ "github.com/lib/pq"
+	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/dexidp/dex/pkg/log"
 )
 
 // flavor represents a specific SQL implementation, and is used to translate query strings
@@ -20,13 +19,7 @@ import (
 type flavor struct {
 	queryReplacers []replacer
 
-	// Optional function to create and finish a transaction. This is mainly for
-	// cockroachdb support which requires special retry logic provided by their
-	// client package.
-	//
-	// This will be nil for most flavors.
-	//
-	// See: https://github.com/cockroachdb/docs/blob/63761c2e/_includes/app/txn-sample.go#L41-L44
+	// Optional function to create and finish a transaction.
 	executeTx func(db *sql.DB, fn func(*sql.Tx) error) error
 
 	// Does the flavor support timezones?
@@ -91,16 +84,22 @@ var (
 		},
 	}
 
-	// Incomplete.
 	flavorMySQL = flavor{
 		queryReplacers: []replacer{
 			{bindRegexp, "?"},
+			// Translate types.
+			{matchLiteral("bytea"), "blob"},
+			{matchLiteral("timestamptz"), "datetime(3)"},
+			// MySQL doesn't support indices on text fields w/o
+			// specifying key length. Use varchar instead (767 byte
+			// is the max key length for InnoDB with 4k pages).
+			// For compound indexes (with two keys) even less.
+			{matchLiteral("text"), "varchar(384)"},
+			// Quote keywords and reserved words used as identifiers.
+			{regexp.MustCompile(`\b(keys)\b`), "`$1`"},
+			// Change default timestamp to fit datetime.
+			{regexp.MustCompile(`0001-01-01 00:00:00 UTC`), "1000-01-01 00:00:00"},
 		},
-	}
-
-	// Not tested.
-	flavorCockroach = flavor{
-		executeTx: crdb.ExecuteTx,
 	}
 )
 
@@ -131,8 +130,8 @@ func (c *conn) translateArgs(args []interface{}) []interface{} {
 // conn is the main database connection.
 type conn struct {
 	db                 *sql.DB
-	flavor             flavor
-	logger             logrus.FieldLogger
+	flavor             *flavor
+	logger             log.Logger
 	alreadyExistsCheck func(err error) bool
 }
 

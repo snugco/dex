@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/coreos/dex/storage"
+	"github.com/dexidp/dex/storage"
 )
 
 // TODO(ericchiang): The update, insert, and select methods queries are all
@@ -84,7 +84,9 @@ type scanner interface {
 	Scan(dest ...interface{}) error
 }
 
-func (c *conn) GarbageCollect(now time.Time) (result storage.GCResult, err error) {
+func (c *conn) GarbageCollect(now time.Time) (storage.GCResult, error) {
+	result := storage.GCResult{}
+
 	r, err := c.Exec(`delete from auth_request where expiry < $1`, now)
 	if err != nil {
 		return result, fmt.Errorf("gc auth_request: %v", err)
@@ -100,7 +102,24 @@ func (c *conn) GarbageCollect(now time.Time) (result storage.GCResult, err error
 	if n, err := r.RowsAffected(); err == nil {
 		result.AuthCodes = n
 	}
-	return
+
+	r, err = c.Exec(`delete from device_request where expiry < $1`, now)
+	if err != nil {
+		return result, fmt.Errorf("gc device_request: %v", err)
+	}
+	if n, err := r.RowsAffected(); err == nil {
+		result.DeviceRequests = n
+	}
+
+	r, err = c.Exec(`delete from device_token where expiry < $1`, now)
+	if err != nil {
+		return result, fmt.Errorf("gc device_token: %v", err)
+	}
+	if n, err := r.RowsAffected(); err == nil {
+		result.DeviceTokens = n
+	}
+
+	return result, err
 }
 
 func (c *conn) CreateAuthRequest(a storage.AuthRequest) error {
@@ -108,21 +127,23 @@ func (c *conn) CreateAuthRequest(a storage.AuthRequest) error {
 		insert into auth_request (
 			id, client_id, response_types, scopes, redirect_uri, nonce, state,
 			force_approval_prompt, logged_in,
-			claims_user_id, claims_username, claims_email, claims_email_verified,
-			claims_groups,
+			claims_user_id, claims_username, claims_preferred_username,
+			claims_email, claims_email_verified, claims_groups,
 			connector_id, connector_data,
-			expiry
+			expiry,
+			code_challenge, code_challenge_method
 		)
 		values (
-			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20
 		);
 	`,
 		a.ID, a.ClientID, encoder(a.ResponseTypes), encoder(a.Scopes), a.RedirectURI, a.Nonce, a.State,
 		a.ForceApprovalPrompt, a.LoggedIn,
-		a.Claims.UserID, a.Claims.Username, a.Claims.Email, a.Claims.EmailVerified,
-		encoder(a.Claims.Groups),
+		a.Claims.UserID, a.Claims.Username, a.Claims.PreferredUsername,
+		a.Claims.Email, a.Claims.EmailVerified, encoder(a.Claims.Groups),
 		a.ConnectorID, a.ConnectorData,
 		a.Expiry,
+		a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
 	)
 	if err != nil {
 		if c.alreadyExistsCheck(err) {
@@ -149,26 +170,29 @@ func (c *conn) UpdateAuthRequest(id string, updater func(a storage.AuthRequest) 
 			set
 				client_id = $1, response_types = $2, scopes = $3, redirect_uri = $4,
 				nonce = $5, state = $6, force_approval_prompt = $7, logged_in = $8,
-				claims_user_id = $9, claims_username = $10, claims_email = $11,
-				claims_email_verified = $12,
-				claims_groups = $13,
-				connector_id = $14, connector_data = $15,
-				expiry = $16
-			where id = $17;
+				claims_user_id = $9, claims_username = $10, claims_preferred_username = $11,
+				claims_email = $12, claims_email_verified = $13,
+				claims_groups = $14,
+				connector_id = $15, connector_data = $16,
+				expiry = $17,
+				code_challenge = $18, code_challenge_method = $19
+			where id = $20;
 		`,
 			a.ClientID, encoder(a.ResponseTypes), encoder(a.Scopes), a.RedirectURI, a.Nonce, a.State,
 			a.ForceApprovalPrompt, a.LoggedIn,
-			a.Claims.UserID, a.Claims.Username, a.Claims.Email, a.Claims.EmailVerified,
+			a.Claims.UserID, a.Claims.Username, a.Claims.PreferredUsername,
+			a.Claims.Email, a.Claims.EmailVerified,
 			encoder(a.Claims.Groups),
 			a.ConnectorID, a.ConnectorData,
-			a.Expiry, r.ID,
+			a.Expiry,
+			a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
+			r.ID,
 		)
 		if err != nil {
 			return fmt.Errorf("update auth request: %v", err)
 		}
 		return nil
 	})
-
 }
 
 func (c *conn) GetAuthRequest(id string) (storage.AuthRequest, error) {
@@ -177,19 +201,22 @@ func (c *conn) GetAuthRequest(id string) (storage.AuthRequest, error) {
 
 func getAuthRequest(q querier, id string) (a storage.AuthRequest, err error) {
 	err = q.QueryRow(`
-		select 
+		select
 			id, client_id, response_types, scopes, redirect_uri, nonce, state,
 			force_approval_prompt, logged_in,
-			claims_user_id, claims_username, claims_email, claims_email_verified,
-			claims_groups,
-			connector_id, connector_data, expiry
+			claims_user_id, claims_username, claims_preferred_username,
+			claims_email, claims_email_verified, claims_groups,
+			connector_id, connector_data, expiry,
+			code_challenge, code_challenge_method
 		from auth_request where id = $1;
 	`, id).Scan(
 		&a.ID, &a.ClientID, decoder(&a.ResponseTypes), decoder(&a.Scopes), &a.RedirectURI, &a.Nonce, &a.State,
 		&a.ForceApprovalPrompt, &a.LoggedIn,
-		&a.Claims.UserID, &a.Claims.Username, &a.Claims.Email, &a.Claims.EmailVerified,
+		&a.Claims.UserID, &a.Claims.Username, &a.Claims.PreferredUsername,
+		&a.Claims.Email, &a.Claims.EmailVerified,
 		decoder(&a.Claims.Groups),
 		&a.ConnectorID, &a.ConnectorData, &a.Expiry,
+		&a.PKCE.CodeChallenge, &a.PKCE.CodeChallengeMethod,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -204,18 +231,19 @@ func (c *conn) CreateAuthCode(a storage.AuthCode) error {
 	_, err := c.Exec(`
 		insert into auth_code (
 			id, client_id, scopes, nonce, redirect_uri,
-			claims_user_id, claims_username,
+			claims_user_id, claims_username, claims_preferred_username,
 			claims_email, claims_email_verified, claims_groups,
 			connector_id, connector_data,
-			expiry
+			expiry,
+			code_challenge, code_challenge_method
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13);
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);
 	`,
 		a.ID, a.ClientID, encoder(a.Scopes), a.Nonce, a.RedirectURI, a.Claims.UserID,
-		a.Claims.Username, a.Claims.Email, a.Claims.EmailVerified, encoder(a.Claims.Groups),
-		a.ConnectorID, a.ConnectorData, a.Expiry,
+		a.Claims.Username, a.Claims.PreferredUsername, a.Claims.Email, a.Claims.EmailVerified,
+		encoder(a.Claims.Groups), a.ConnectorID, a.ConnectorData, a.Expiry,
+		a.PKCE.CodeChallenge, a.PKCE.CodeChallengeMethod,
 	)
-
 	if err != nil {
 		if c.alreadyExistsCheck(err) {
 			return storage.ErrAlreadyExists
@@ -229,15 +257,17 @@ func (c *conn) GetAuthCode(id string) (a storage.AuthCode, err error) {
 	err = c.QueryRow(`
 		select
 			id, client_id, scopes, nonce, redirect_uri,
-			claims_user_id, claims_username,
+			claims_user_id, claims_username, claims_preferred_username,
 			claims_email, claims_email_verified, claims_groups,
 			connector_id, connector_data,
-			expiry
+			expiry,
+			code_challenge, code_challenge_method
 		from auth_code where id = $1;
 	`, id).Scan(
 		&a.ID, &a.ClientID, decoder(&a.Scopes), &a.Nonce, &a.RedirectURI, &a.Claims.UserID,
-		&a.Claims.Username, &a.Claims.Email, &a.Claims.EmailVerified, decoder(&a.Claims.Groups),
-		&a.ConnectorID, &a.ConnectorData, &a.Expiry,
+		&a.Claims.Username, &a.Claims.PreferredUsername, &a.Claims.Email, &a.Claims.EmailVerified,
+		decoder(&a.Claims.Groups), &a.ConnectorID, &a.ConnectorData, &a.Expiry,
+		&a.PKCE.CodeChallenge, &a.PKCE.CodeChallengeMethod,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -252,18 +282,19 @@ func (c *conn) CreateRefresh(r storage.RefreshToken) error {
 	_, err := c.Exec(`
 		insert into refresh_token (
 			id, client_id, scopes, nonce,
-			claims_user_id, claims_username, claims_email, claims_email_verified,
-			claims_groups,
+			claims_user_id, claims_username, claims_preferred_username,
+			claims_email, claims_email_verified, claims_groups,
 			connector_id, connector_data,
-			token, created_at, last_used
+			token, obsolete_token, created_at, last_used
 		)
-		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14);
+		values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16);
 	`,
 		r.ID, r.ClientID, encoder(r.Scopes), r.Nonce,
-		r.Claims.UserID, r.Claims.Username, r.Claims.Email, r.Claims.EmailVerified,
+		r.Claims.UserID, r.Claims.Username, r.Claims.PreferredUsername,
+		r.Claims.Email, r.Claims.EmailVerified,
 		encoder(r.Claims.Groups),
 		r.ConnectorID, r.ConnectorData,
-		r.Token, r.CreatedAt, r.LastUsed,
+		r.Token, r.ObsoleteToken, r.CreatedAt, r.LastUsed,
 	)
 	if err != nil {
 		if c.alreadyExistsCheck(err) {
@@ -291,22 +322,25 @@ func (c *conn) UpdateRefreshToken(id string, updater func(old storage.RefreshTok
 				nonce = $3,
 				claims_user_id = $4,
 				claims_username = $5,
-				claims_email = $6,
-				claims_email_verified = $7,
-				claims_groups = $8,
-				connector_id = $9,
-				connector_data = $10,
-				token = $11,
-				created_at = $12,
-				last_used = $13
+				claims_preferred_username = $6,
+				claims_email = $7,
+				claims_email_verified = $8,
+				claims_groups = $9,
+				connector_id = $10,
+				connector_data = $11,
+				token = $12,
+                obsolete_token = $13,
+				created_at = $14,
+				last_used = $15
 			where
-				id = $14
+				id = $16
 		`,
 			r.ClientID, encoder(r.Scopes), r.Nonce,
-			r.Claims.UserID, r.Claims.Username, r.Claims.Email, r.Claims.EmailVerified,
+			r.Claims.UserID, r.Claims.Username, r.Claims.PreferredUsername,
+			r.Claims.Email, r.Claims.EmailVerified,
 			encoder(r.Claims.Groups),
 			r.ConnectorID, r.ConnectorData,
-			r.Token, r.CreatedAt, r.LastUsed, id,
+			r.Token, r.ObsoleteToken, r.CreatedAt, r.LastUsed, id,
 		)
 		if err != nil {
 			return fmt.Errorf("update refresh token: %v", err)
@@ -323,10 +357,11 @@ func getRefresh(q querier, id string) (storage.RefreshToken, error) {
 	return scanRefresh(q.QueryRow(`
 		select
 			id, client_id, scopes, nonce,
-			claims_user_id, claims_username, claims_email, claims_email_verified,
+			claims_user_id, claims_username, claims_preferred_username,
+			claims_email, claims_email_verified,
 			claims_groups,
 			connector_id, connector_data,
-			token, created_at, last_used
+			token, obsolete_token, created_at, last_used
 		from refresh_token where id = $1;
 	`, id))
 }
@@ -335,15 +370,17 @@ func (c *conn) ListRefreshTokens() ([]storage.RefreshToken, error) {
 	rows, err := c.Query(`
 		select
 			id, client_id, scopes, nonce,
-			claims_user_id, claims_username, claims_email, claims_email_verified,
-			claims_groups,
+			claims_user_id, claims_username, claims_preferred_username,
+			claims_email, claims_email_verified, claims_groups,
 			connector_id, connector_data,
-			token, created_at, last_used
+			token, obsolete_token, created_at, last_used
 		from refresh_token;
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("query: %v", err)
 	}
+	defer rows.Close()
+
 	var tokens []storage.RefreshToken
 	for rows.Next() {
 		r, err := scanRefresh(rows)
@@ -361,10 +398,11 @@ func (c *conn) ListRefreshTokens() ([]storage.RefreshToken, error) {
 func scanRefresh(s scanner) (r storage.RefreshToken, err error) {
 	err = s.Scan(
 		&r.ID, &r.ClientID, decoder(&r.Scopes), &r.Nonce,
-		&r.Claims.UserID, &r.Claims.Username, &r.Claims.Email, &r.Claims.EmailVerified,
+		&r.Claims.UserID, &r.Claims.Username, &r.Claims.PreferredUsername,
+		&r.Claims.Email, &r.Claims.EmailVerified,
 		decoder(&r.Claims.Groups),
 		&r.ConnectorID, &r.ConnectorData,
-		&r.Token, &r.CreatedAt, &r.LastUsed,
+		&r.Token, &r.ObsoleteToken, &r.CreatedAt, &r.LastUsed,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -410,7 +448,7 @@ func (c *conn) UpdateKeys(updater func(old storage.Keys) (storage.Keys, error)) 
 		} else {
 			_, err = tx.Exec(`
 				update keys
-				set 
+				set
 				    verification_keys = $1,
 					signing_key = $2,
 					signing_key_pub = $3,
@@ -521,6 +559,8 @@ func (c *conn) ListClients() ([]storage.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+
 	var clients []storage.Client
 	for rows.Next() {
 		cli, err := scanClient(rows)
@@ -617,6 +657,7 @@ func (c *conn) ListPasswords() ([]storage.Password, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 
 	var passwords []storage.Password
 	for rows.Next() {
@@ -648,13 +689,13 @@ func scanPassword(s scanner) (p storage.Password, err error) {
 func (c *conn) CreateOfflineSessions(s storage.OfflineSessions) error {
 	_, err := c.Exec(`
 		insert into offline_session (
-			user_id, conn_id, refresh
+			user_id, conn_id, refresh, connector_data
 		)
 		values (
-			$1, $2, $3
+			$1, $2, $3, $4
 		);
 	`,
-		s.UserID, s.ConnID, encoder(s.Refresh),
+		s.UserID, s.ConnID, encoder(s.Refresh), s.ConnectorData,
 	)
 	if err != nil {
 		if c.alreadyExistsCheck(err) {
@@ -679,10 +720,11 @@ func (c *conn) UpdateOfflineSessions(userID string, connID string, updater func(
 		_, err = tx.Exec(`
 			update offline_session
 			set
-				refresh = $1
-			where user_id = $2 AND conn_id = $3;
+				refresh = $1,
+				connector_data = $2
+			where user_id = $3 AND conn_id = $4;
 		`,
-			encoder(newSession.Refresh), s.UserID, s.ConnID,
+			encoder(newSession.Refresh), newSession.ConnectorData, s.UserID, s.ConnID,
 		)
 		if err != nil {
 			return fmt.Errorf("update offline session: %v", err)
@@ -698,7 +740,7 @@ func (c *conn) GetOfflineSessions(userID string, connID string) (storage.Offline
 func getOfflineSessions(q querier, userID string, connID string) (storage.OfflineSessions, error) {
 	return scanOfflineSessions(q.QueryRow(`
 		select
-			user_id, conn_id, refresh
+			user_id, conn_id, refresh, connector_data
 		from offline_session
 		where user_id = $1 AND conn_id = $2;
 		`, userID, connID))
@@ -706,7 +748,7 @@ func getOfflineSessions(q querier, userID string, connID string) (storage.Offlin
 
 func scanOfflineSessions(s scanner) (o storage.OfflineSessions, err error) {
 	err = s.Scan(
-		&o.UserID, &o.ConnID, decoder(&o.Refresh),
+		&o.UserID, &o.ConnID, decoder(&o.Refresh), &o.ConnectorData,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -750,7 +792,7 @@ func (c *conn) UpdateConnector(id string, updater func(s storage.Connector) (sto
 		}
 		_, err = tx.Exec(`
 			update connector
-			set 
+			set
 			    type = $1,
 			    name = $2,
 			    resource_version = $3,
@@ -801,6 +843,8 @@ func (c *conn) ListConnectors() ([]storage.Connector, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
+
 	var connectors []storage.Connector
 	for rows.Next() {
 		conn, err := scanConnector(rows)
@@ -859,4 +903,116 @@ func (c *conn) delete(table, field, id string) error {
 		return storage.ErrNotFound
 	}
 	return nil
+}
+
+func (c *conn) CreateDeviceRequest(d storage.DeviceRequest) error {
+	_, err := c.Exec(`
+		insert into device_request (
+			user_code, device_code, client_id, client_secret, scopes, expiry
+		)
+		values (
+			$1, $2, $3, $4, $5, $6
+		);`,
+		d.UserCode, d.DeviceCode, d.ClientID, d.ClientSecret, encoder(d.Scopes), d.Expiry,
+	)
+	if err != nil {
+		if c.alreadyExistsCheck(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("insert device request: %v", err)
+	}
+	return nil
+}
+
+func (c *conn) CreateDeviceToken(t storage.DeviceToken) error {
+	_, err := c.Exec(`
+		insert into device_token (
+			device_code, status, token, expiry, last_request, poll_interval, code_challenge, code_challenge_method
+		)
+		values (
+			$1, $2, $3, $4, $5, $6, $7, $8
+		);`,
+		t.DeviceCode, t.Status, t.Token, t.Expiry, t.LastRequestTime, t.PollIntervalSeconds, t.PKCE.CodeChallenge, t.PKCE.CodeChallengeMethod,
+	)
+	if err != nil {
+		if c.alreadyExistsCheck(err) {
+			return storage.ErrAlreadyExists
+		}
+		return fmt.Errorf("insert device token: %v", err)
+	}
+	return nil
+}
+
+func (c *conn) GetDeviceRequest(userCode string) (storage.DeviceRequest, error) {
+	return getDeviceRequest(c, userCode)
+}
+
+func getDeviceRequest(q querier, userCode string) (d storage.DeviceRequest, err error) {
+	err = q.QueryRow(`
+		select
+            device_code, client_id, client_secret, scopes, expiry
+		from device_request where user_code = $1;
+	`, userCode).Scan(
+		&d.DeviceCode, &d.ClientID, &d.ClientSecret, decoder(&d.Scopes), &d.Expiry,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return d, storage.ErrNotFound
+		}
+		return d, fmt.Errorf("select device token: %v", err)
+	}
+	d.UserCode = userCode
+	return d, nil
+}
+
+func (c *conn) GetDeviceToken(deviceCode string) (storage.DeviceToken, error) {
+	return getDeviceToken(c, deviceCode)
+}
+
+func getDeviceToken(q querier, deviceCode string) (a storage.DeviceToken, err error) {
+	err = q.QueryRow(`
+		select
+            status, token, expiry, last_request, poll_interval, code_challenge, code_challenge_method
+		from device_token where device_code = $1;
+	`, deviceCode).Scan(
+		&a.Status, &a.Token, &a.Expiry, &a.LastRequestTime, &a.PollIntervalSeconds, &a.PKCE.CodeChallenge, &a.PKCE.CodeChallengeMethod,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return a, storage.ErrNotFound
+		}
+		return a, fmt.Errorf("select device token: %v", err)
+	}
+	a.DeviceCode = deviceCode
+	return a, nil
+}
+
+func (c *conn) UpdateDeviceToken(deviceCode string, updater func(old storage.DeviceToken) (storage.DeviceToken, error)) error {
+	return c.ExecTx(func(tx *trans) error {
+		r, err := getDeviceToken(tx, deviceCode)
+		if err != nil {
+			return err
+		}
+		if r, err = updater(r); err != nil {
+			return err
+		}
+		_, err = tx.Exec(`
+			update device_token
+			set
+				status = $1, 
+				token = $2,
+				last_request = $3,
+				poll_interval = $4,
+				code_challenge = $5,
+				code_challenge_method = $6
+			where
+				device_code = $7
+		`,
+			r.Status, r.Token, r.LastRequestTime, r.PollIntervalSeconds, r.PKCE.CodeChallenge, r.PKCE.CodeChallengeMethod, r.DeviceCode,
+		)
+		if err != nil {
+			return fmt.Errorf("update device token: %v", err)
+		}
+		return nil
+	})
 }

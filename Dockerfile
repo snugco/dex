@@ -1,29 +1,72 @@
-FROM golang:1.8.3-alpine
+ARG BASE_IMAGE=alpine
 
-MAINTAINER Ed Rooth <ed.rooth@coreos.com>
-MAINTAINER Lucas Servén <lucas.serven@coreos.com>
-MAINTAINER Rithu John <rithu.john@coreos.com>
+FROM golang:1.18.4-alpine3.15 AS builder
 
-RUN apk add --no-cache --update alpine-sdk
+WORKDIR /usr/local/src/dex
 
-COPY . /go/src/github.com/coreos/dex
-RUN cd /go/src/github.com/coreos/dex && make release-binary
+RUN apk add --no-cache --update alpine-sdk ca-certificates openssl
 
-FROM alpine:3.4
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT=""
+
+ENV GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETVARIANT}
+
+ARG GOPROXY
+
+COPY go.mod go.sum ./
+COPY api/v2/go.mod api/v2/go.sum ./api/v2/
+RUN go mod download
+
+COPY . .
+
+RUN make release-binary
+
+FROM alpine:3.16.1 AS stager
+
+RUN mkdir -p /var/dex
+RUN mkdir -p /etc/dex
+COPY config.docker.yaml /etc/dex/
+
+FROM alpine:3.16.1 AS gomplate
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
+
+ENV GOMPLATE_VERSION=v3.10.0
+
+RUN wget -O /usr/local/bin/gomplate \
+    "https://github.com/hairyhenderson/gomplate/releases/download/${GOMPLATE_VERSION}/gomplate_${TARGETOS:-linux}-${TARGETARCH:-amd64}${TARGETVARIANT}" \
+    && chmod +x /usr/local/bin/gomplate
+
+# For Dependabot to detect base image versions
+FROM alpine:3.16.1 AS alpine
+FROM gcr.io/distroless/static:latest AS distroless
+
+FROM $BASE_IMAGE
+
 # Dex connectors, such as GitHub and Google logins require root certificates.
 # Proper installations should manage those certificates, but it's a bad user
 # experience when this doesn't work out of the box.
 #
-# OpenSSL is required so wget can query HTTPS endpoints for health checking.
-RUN apk add --update ca-certificates openssl
+# See https://go.dev/src/crypto/x509/root_linux.go for Go root CA bundle locations.
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
-COPY --from=0 /go/bin/dex /usr/local/bin/dex
+COPY --from=stager --chown=1001:1001 /var/dex /var/dex
+COPY --from=stager --chown=1001:1001 /etc/dex /etc/dex
 
-# Import frontend assets and set the correct CWD directory so the assets
-# are in the default path.
-COPY web /web
-WORKDIR /
+# Copy module files for CVE scanning / dependency analysis.
+COPY --from=builder /usr/local/src/dex/go.mod /usr/local/src/dex/go.sum /usr/local/src/dex/
+COPY --from=builder /usr/local/src/dex/api/v2/go.mod /usr/local/src/dex/api/v2/go.sum /usr/local/src/dex/api/v2/
 
-ENTRYPOINT ["dex"]
+COPY --from=builder /go/bin/dex /usr/local/bin/dex
+COPY --from=builder /go/bin/docker-entrypoint /usr/local/bin/docker-entrypoint
+COPY --from=builder /usr/local/src/dex/web /srv/dex/web
 
-CMD ["version"]
+COPY --from=gomplate /usr/local/bin/gomplate /usr/local/bin/gomplate
+
+USER 1001:1001
+
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint"]
+CMD ["dex", "serve", "/etc/dex/config.docker.yaml"]

@@ -1,5 +1,3 @@
-// +build go1.7
-
 package conformance
 
 import (
@@ -8,7 +6,7 @@ import (
 
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/coreos/dex/storage"
+	"github.com/dexidp/dex/storage"
 )
 
 // RunTransactionTests runs a test suite aimed a verifying the transaction
@@ -137,8 +135,8 @@ func testKeysConcurrentUpdate(t *testing.T, s storage.Storage) {
 	for i := 0; i < 2; i++ {
 		n := time.Now().UTC().Round(time.Second)
 		keys1 := storage.Keys{
-			SigningKey:    jsonWebKeys[0].Private,
-			SigningKeyPub: jsonWebKeys[0].Public,
+			SigningKey:    jsonWebKeys[i].Private,
+			SigningKeyPub: jsonWebKeys[i].Public,
 			NextRotation:  n,
 		}
 

@@ -23,10 +23,11 @@ type Scopes struct {
 
 // Identity represents the ID Token claims supported by the server.
 type Identity struct {
-	UserID        string
-	Username      string
-	Email         string
-	EmailVerified bool
+	UserID            string
+	Username          string
+	PreferredUsername string
+	Email             string
+	EmailVerified     bool
 
 	Groups []string
 
@@ -39,7 +40,10 @@ type Identity struct {
 
 // PasswordConnector is an interface implemented by connectors which take a
 // username and password.
+// Prompt() is used to inform the handler what to display in the password
+// template. If this returns an empty string, it'll default to "Username".
 type PasswordConnector interface {
+	Prompt() string
 	Login(ctx context.Context, s Scopes, username, password string) (identity Identity, validPassword bool, err error)
 }
 
@@ -76,7 +80,7 @@ type SAMLConnector interface {
 	//
 	// POSTData should encode the provided request ID in the returned serialized
 	// SAML request.
-	POSTData(s Scopes, requestID string) (sooURL, samlRequest string, err error)
+	POSTData(s Scopes, requestID string) (ssoURL, samlRequest string, err error)
 
 	// HandlePOST decodes, verifies, and maps attributes from the SAML response.
 	// It passes the expected value of the "InResponseTo" response field, which
