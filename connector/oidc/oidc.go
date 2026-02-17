@@ -36,6 +36,11 @@ type Config struct {
 	// Optional list of whitelisted domains when using Google
 	// If this field is nonempty, only users from a listed domain will be allowed to log in
 	HostedDomains []string `json:"hostedDomains"`
+
+	// Prompt specifies the prompt parameter for the authorization request.
+	// Common values: "select_account", "consent", "login", "none".
+	// See: https://openid.net/specs/openid-connect-core-1_0.html#AuthRequest
+	Prompt string `json:"prompt"`
 }
 
 // Domains that don't support basic auth. golang.org/x/oauth2 has an internal
@@ -116,6 +121,7 @@ func (c *Config) Open(id string, logger logrus.FieldLogger) (conn connector.Conn
 		logger:        logger,
 		cancel:        cancel,
 		hostedDomains: c.HostedDomains,
+		prompt:        c.Prompt,
 	}, nil
 }
 
@@ -132,6 +138,7 @@ type oidcConnector struct {
 	cancel        context.CancelFunc
 	logger        logrus.FieldLogger
 	hostedDomains []string
+	prompt        string
 }
 
 func (c *oidcConnector) Close() error {
@@ -144,14 +151,21 @@ func (c *oidcConnector) LoginURL(s connector.Scopes, callbackURL, state string) 
 		return "", fmt.Errorf("expected callback URL %q did not match the URL in the config %q", callbackURL, c.redirectURI)
 	}
 
+	var opts []oauth2.AuthCodeOption
+
+	if c.prompt != "" {
+		opts = append(opts, oauth2.SetAuthURLParam("prompt", c.prompt))
+	}
+
 	if len(c.hostedDomains) > 0 {
 		preferredDomain := c.hostedDomains[0]
 		if len(c.hostedDomains) > 1 {
 			preferredDomain = "*"
 		}
-		return c.oauth2Config.AuthCodeURL(state, oauth2.SetAuthURLParam("hd", preferredDomain)), nil
+		opts = append(opts, oauth2.SetAuthURLParam("hd", preferredDomain))
 	}
-	return c.oauth2Config.AuthCodeURL(state), nil
+
+	return c.oauth2Config.AuthCodeURL(state, opts...), nil
 }
 
 type oauth2Error struct {
