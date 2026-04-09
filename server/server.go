@@ -32,6 +32,7 @@ import (
 	"github.com/dexidp/dex/connector/atlassiancrowd"
 	"github.com/dexidp/dex/connector/authproxy"
 	"github.com/dexidp/dex/connector/bitbucketcloud"
+	"github.com/dexidp/dex/connector/facebook"
 	"github.com/dexidp/dex/connector/gitea"
 	"github.com/dexidp/dex/connector/github"
 	"github.com/dexidp/dex/connector/gitlab"
@@ -646,6 +647,7 @@ type ConnectorConfig interface {
 // ConnectorsConfig variable provides an easy way to return a config struct
 // depending on the connector type.
 var ConnectorsConfig = map[string]func() ConnectorConfig{
+	"facebook":        func() ConnectorConfig { return new(facebook.Config) },
 	"keystone":        func() ConnectorConfig { return new(keystone.Config) },
 	"mockCallback":    func() ConnectorConfig { return new(mock.CallbackConfig) },
 	"mockPassword":    func() ConnectorConfig { return new(mock.PasswordConfig) },
