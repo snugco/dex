@@ -166,6 +166,162 @@ func TestPassword(t *testing.T) {
 	}
 }
 
+// TestUpdatePasswordEmail verifies the Snug-specific new_email extension on
+// UpdatePassword: the password record is re-keyed to the new address, the old
+// address returns ErrNotFound, and simultaneous field updates work correctly.
+func TestUpdatePasswordEmail(t *testing.T) {
+	logger := slog.New(slog.DiscardHandler)
+
+	s := memory.New(logger)
+	client := newAPI(s, logger, t)
+	defer client.Close()
+
+	ctx := context.Background()
+
+	// bcrypt hash of "test1" with cost 10 — reused across subtests for speed.
+	validHash := []byte("$2a$10$XVMN/Fid.Ks4CXgzo8fpR.iU1khOMsP5g9xQeXuBm1wXjRX8pjUtO")
+
+	// createPassword is a helper that creates a password and fails the test on error.
+	createPassword := func(t *testing.T, email, username, userID string) {
+		t.Helper()
+		resp, err := client.CreatePassword(ctx, &api.CreatePasswordReq{
+			Password: &api.Password{
+				Email:    email,
+				Hash:     validHash,
+				Username: username,
+				UserId:   userID,
+			},
+		})
+		if err != nil {
+			t.Fatalf("CreatePassword(%s): %v", email, err)
+		}
+		if resp.AlreadyExists {
+			t.Fatalf("CreatePassword(%s): already exists", email)
+		}
+	}
+
+	t.Run("update email only", func(t *testing.T) {
+		createPassword(t, "email-a@example.com", "user-a", "uid-a")
+
+		resp, err := client.UpdatePassword(ctx, &api.UpdatePasswordReq{
+			Email:    "email-a@example.com",
+			NewEmail: "email-b@example.com",
+		})
+		if err != nil {
+			t.Fatalf("UpdatePassword: %v", err)
+		}
+		if resp.NotFound {
+			t.Fatal("UpdatePassword: unexpected not_found")
+		}
+
+		// New email should resolve.
+		p, err := s.GetPassword(ctx, "email-b@example.com")
+		if err != nil {
+			t.Fatalf("GetPassword(new email): %v", err)
+		}
+		if p.Email != "email-b@example.com" {
+			t.Errorf("expected email %q, got %q", "email-b@example.com", p.Email)
+		}
+
+		// Old email must no longer resolve.
+		_, err = s.GetPassword(ctx, "email-a@example.com")
+		if err != storage.ErrNotFound {
+			t.Errorf("expected ErrNotFound for old email, got %v", err)
+		}
+
+		// Cleanup.
+		if _, err := client.DeletePassword(ctx, &api.DeletePasswordReq{Email: "email-b@example.com"}); err != nil {
+			t.Fatalf("cleanup DeletePassword: %v", err)
+		}
+	})
+
+	t.Run("update email and username simultaneously", func(t *testing.T) {
+		createPassword(t, "multi-a@example.com", "original-name", "uid-multi")
+
+		resp, err := client.UpdatePassword(ctx, &api.UpdatePasswordReq{
+			Email:       "multi-a@example.com",
+			NewEmail:    "multi-b@example.com",
+			NewUsername: "updated-name",
+		})
+		if err != nil {
+			t.Fatalf("UpdatePassword: %v", err)
+		}
+		if resp.NotFound {
+			t.Fatal("UpdatePassword: unexpected not_found")
+		}
+
+		p, err := s.GetPassword(ctx, "multi-b@example.com")
+		if err != nil {
+			t.Fatalf("GetPassword(new email): %v", err)
+		}
+		if p.Email != "multi-b@example.com" {
+			t.Errorf("expected email %q, got %q", "multi-b@example.com", p.Email)
+		}
+		if p.Username != "updated-name" {
+			t.Errorf("expected username %q, got %q", "updated-name", p.Username)
+		}
+
+		// Old email must no longer resolve.
+		_, err = s.GetPassword(ctx, "multi-a@example.com")
+		if err != storage.ErrNotFound {
+			t.Errorf("expected ErrNotFound for old email, got %v", err)
+		}
+
+		// Cleanup.
+		if _, err := client.DeletePassword(ctx, &api.DeletePasswordReq{Email: "multi-b@example.com"}); err != nil {
+			t.Fatalf("cleanup DeletePassword: %v", err)
+		}
+	})
+
+	t.Run("update username only leaves email unchanged", func(t *testing.T) {
+		createPassword(t, "stable@example.com", "old-name", "uid-stable")
+
+		resp, err := client.UpdatePassword(ctx, &api.UpdatePasswordReq{
+			Email:       "stable@example.com",
+			NewUsername: "new-name",
+		})
+		if err != nil {
+			t.Fatalf("UpdatePassword: %v", err)
+		}
+		if resp.NotFound {
+			t.Fatal("UpdatePassword: unexpected not_found")
+		}
+
+		p, err := s.GetPassword(ctx, "stable@example.com")
+		if err != nil {
+			t.Fatalf("GetPassword: %v", err)
+		}
+		if p.Email != "stable@example.com" {
+			t.Errorf("expected email unchanged, got %q", p.Email)
+		}
+		if p.Username != "new-name" {
+			t.Errorf("expected username %q, got %q", "new-name", p.Username)
+		}
+
+		// Cleanup.
+		if _, err := client.DeletePassword(ctx, &api.DeletePasswordReq{Email: "stable@example.com"}); err != nil {
+			t.Fatalf("cleanup DeletePassword: %v", err)
+		}
+	})
+
+	t.Run("nothing to update returns error", func(t *testing.T) {
+		createPassword(t, "noop@example.com", "noop-user", "uid-noop")
+
+		_, err := client.UpdatePassword(ctx, &api.UpdatePasswordReq{
+			Email: "noop@example.com",
+			// No NewHash, no NewUsername, no NewEmail — should be rejected.
+		})
+		if err == nil {
+			t.Fatal("expected error when no fields provided, got nil")
+		}
+
+		// Cleanup.
+		if _, err := client.DeletePassword(ctx, &api.DeletePasswordReq{Email: "noop@example.com"}); err != nil {
+			t.Fatalf("cleanup DeletePassword: %v", err)
+		}
+	})
+}
+
 // Ensures checkCost returns expected values
 func TestCheckCost(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)

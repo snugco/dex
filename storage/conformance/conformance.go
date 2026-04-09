@@ -508,6 +508,21 @@ func testPasswordCRUD(t *testing.T, s storage.Storage) {
 	password1.Username = "jane doe"
 	getAndCompare("jane@example.com", password1)
 
+	// Snug extension: verify that updating the email address re-keys the record.
+	// After update, the new email resolves and the old email returns ErrNotFound.
+	if err := s.UpdatePassword(ctx, password1.Email, func(old storage.Password) (storage.Password, error) {
+		old.Email = "jane.new@example.com"
+		return old, nil
+	}); err != nil {
+		t.Fatalf("failed to update password email: %v", err)
+	}
+
+	password1.Email = "jane.new@example.com"
+	getAndCompare("jane.new@example.com", password1)
+
+	_, err = s.GetPassword(ctx, "jane@example.com")
+	mustBeErrNotFound(t, "password with old email after email update", err)
+
 	var passwordList []storage.Password
 	passwordList = append(passwordList, password1, password2)
 

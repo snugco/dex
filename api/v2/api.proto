@@ -87,10 +87,13 @@ message CreatePasswordResp {
 
 // UpdatePasswordReq is a request to modify an existing password.
 message UpdatePasswordReq {
-  // The email used to lookup the password. This field cannot be modified
+  // The email used to lookup the password.
   string email = 1;
   bytes new_hash = 2;
   string new_username = 3;
+  // Snug extension: change the email address associated with this password.
+  // When set, the password record is re-keyed to new_email after the update.
+  string new_email = 4;
 }
 
 // UpdatePasswordResp returns the response from modifying an existing password.

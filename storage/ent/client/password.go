@@ -81,8 +81,10 @@ func (d *Database) UpdatePassword(ctx context.Context, email string, updater fun
 		return rollback(tx, "update password updating: %w", err)
 	}
 
+	// Use the original email in the WHERE clause so that email re-keying works
+	// correctly (Snug extension: updater may change Email to a new address).
 	_, err = tx.Password.Update().
-		Where(password.Email(newPassword.Email)).
+		Where(password.Email(email)).
 		SetEmail(newPassword.Email).
 		SetHash(newPassword.Hash).
 		SetUsername(newPassword.Username).

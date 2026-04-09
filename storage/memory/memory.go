@@ -432,7 +432,13 @@ func (s *memStorage) UpdatePassword(ctx context.Context, email string, updater f
 			return
 		}
 		if req, err = updater(req); err == nil {
-			s.passwords[email] = req
+			// If the email address changed, re-key the map entry so that the
+			// old address no longer resolves (Snug extension for email updates).
+			newEmail := strings.ToLower(req.Email)
+			if newEmail != email {
+				delete(s.passwords, email)
+			}
+			s.passwords[newEmail] = req
 		}
 	})
 	return
