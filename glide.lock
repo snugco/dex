@@ -38,9 +38,10 @@ imports:
   - diff
   - pretty
 - name: github.com/lib/pq
-  version: 50761b0867bd1d9d069276790bcd4a3bccf2324a
+  version: 2a217b94f5ccd3de31aec4152a541b9ff64bed05
   subpackages:
   - oid
+  - scram
 - name: github.com/pquerna/cachecontrol
   version: c97913dcbd76de40b051a9b4cd827f7eaeb7a868
   subpackages:
